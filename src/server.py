@@ -15,7 +15,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+from sklearn.metrics import (
+    adjusted_rand_score,
+    f1_score,
+    normalized_mutual_info_score,
+)
+
 from sklearn.mixture import BayesianGaussianMixture
 from sklearn.preprocessing import StandardScaler
 
@@ -264,6 +269,37 @@ class FLServer:
     # ══════════════════════════════════════════════════════
     #  Group model initialization / re-initialization
     # ══════════════════════════════════════════════════════
+    def _cluster_quality_metrics(self) -> Dict[str, float]:
+        """
+        Compute clustering quality against ground-truth groups.
+
+        These metrics are only for synthetic/controlled experiments where
+        client.group_id is available. They are not used by CARES itself.
+        """
+        y_true = np.array(
+            [int(self.clients[i].group_id) for i in range(self.num_clients)],
+            dtype=int,
+        )
+        y_pred = self.assignments.astype(int)
+
+        ari = adjusted_rand_score(y_true, y_pred)
+        nmi = normalized_mutual_info_score(y_true, y_pred)
+
+        purity_correct = 0
+        for _, members in self._get_cluster_map().items():
+            labels = y_true[members]
+            if len(labels) == 0:
+                continue
+            _, counts = np.unique(labels, return_counts=True)
+            purity_correct += int(counts.max())
+
+        purity = purity_correct / max(self.num_clients, 1)
+
+        return {
+            "ari": float(ari),
+            "nmi": float(nmi),
+            "purity": float(purity),
+        }
 
     def _init_group_models(self):
         cluster_map = self._get_cluster_map()
@@ -306,7 +342,7 @@ class FLServer:
             new_models[new_gid] = model
 
         self.cluster_models = new_models
-        print(f"  [Server] Re-initialized {len(self.cluster_models)} group models "
+        print(f" [Server] Matched and inherited {len(self.cluster_models)} group models "
               f"after re-clustering")
 
     @staticmethod
@@ -326,6 +362,37 @@ class FLServer:
     # ══════════════════════════════════════════════════════
     #  Evaluation
     # ══════════════════════════════════════════════════════
+    def evaluate_global_model(self) -> Dict[str, float]:
+        """Evaluate the warm-up global model before clustering."""
+        accs, f1s = [], []
+        all_yt, all_yp = [], []
+        total_correct, total_n = 0, 0
+
+        for client in self.clients:
+            yt, yp = client.evaluate(self.global_model)
+            correct = int((yt == yp).sum())
+            n = len(yt)
+
+            accs.append(correct / max(n, 1))
+            f1s.append(f1_score(yt, yp, average="macro", zero_division=0))
+
+            all_yt.extend(yt.tolist())
+            all_yp.extend(yp.tolist())
+            total_correct += correct
+            total_n += n
+
+        return {
+            "client_avg_acc": float(np.mean(accs)),
+            "micro_acc": float(total_correct / max(total_n, 1)),
+            "client_avg_macro_f1": float(np.mean(f1s)),
+            "global_macro_f1": float(f1_score(
+                all_yt,
+                all_yp,
+                average="macro",
+                labels=list(range(10)),
+                zero_division=0,
+            )),
+        }
 
     def evaluate(self) -> Dict[str, float]:
         accs, f1s = [], []
@@ -348,16 +415,38 @@ class FLServer:
             total_correct += correct
             total_n += n
 
-        return {
+        metrics = {
             "k_pred": self.k_pred,
             "client_avg_acc": float(np.mean(accs)),
             "micro_acc": float(total_correct / max(total_n, 1)),
             "client_avg_macro_f1": float(np.mean(f1s)),
             "global_macro_f1": float(f1_score(
-                all_yt, all_yp, average="macro",
-                labels=list(range(10)), zero_division=0,
+                all_yt,
+                all_yp,
+                average="macro",
+                labels=list(range(10)),
+                zero_division=0,
             )),
         }
+
+        metrics.update(self._cluster_quality_metrics())
+        return metrics
+
+    def _print_eval_snapshot(self, tag: str):
+        """Print a lightweight evaluation snapshot during training."""
+        metrics = self.evaluate()
+
+        print(
+            f"  [Eval:{tag}] "
+            f"K={metrics['k_pred']} | "
+            f"MicroAcc={metrics['micro_acc']:.4f} | "
+            f"ClientAvgAcc={metrics['client_avg_acc']:.4f} | "
+            f"GlobalMacroF1={metrics['global_macro_f1']:.4f} | "
+            f"ClientAvgMacroF1={metrics['client_avg_macro_f1']:.4f} | "
+            f"ARI={metrics.get('ari', float('nan')):.4f} | "
+            f"NMI={metrics.get('nmi', float('nan')):.4f} | "
+            f"Purity={metrics.get('purity', float('nan')):.4f}"
+        )
 
     # ══════════════════════════════════════════════════════
     #  Print helpers
@@ -454,6 +543,14 @@ class FLServer:
 
             print(f"  [Warmup] Round {t + 1}/{warmup_rounds} done "
                   f"(selected {len(selected)} clients)")
+
+            warm_metrics = self.evaluate_global_model()
+            print(
+                f"  [Eval:Warmup R{t + 1}] "
+                f"MicroAcc={warm_metrics['micro_acc']:.4f} | "
+                f"ClientAvgAcc={warm_metrics['client_avg_acc']:.4f} | "
+                f"GlobalMacroF1={warm_metrics['global_macro_f1']:.4f}"
+            )
 
         # ════════════════════════════════════════════════
         #  过渡：首次全量 Profiling + DPMM 聚类
@@ -557,6 +654,7 @@ class FLServer:
             if (t_c + 1) % 5 == 0 or t_c == 0:
                 print(f"  [Clustered] Round {t_global + 1}/{total_rounds} done "
                       f"(selected {len(selected)} clients)")
+                self._print_eval_snapshot(f"R{t_global + 1}")
 
         # ════════════════════════════════════════════════
         #  Evaluation

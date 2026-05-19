@@ -4,7 +4,10 @@ CARES-Lite: Adaptive Clustered Federated Learning (Plaintext)
 ==============================================================
 Entry point: build data → create clients → create server → run pipeline.
 """
+import os
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 from pathlib import Path
 
 import pandas as pd
