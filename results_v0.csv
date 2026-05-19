@@ -1,0 +1,3 @@
+method,k_setting,k_pred,client_avg_acc,micro_acc,client_avg_macro_f1,global_macro_f1
+FedAvg,-,-,0.7166,0.7166,0.534443595300934,0.638612393775521
+Loss-DPMM + ClusterFedAvg,auto,4,0.8271999999999999,0.8272,0.5681639292692489,0.7890753896171327

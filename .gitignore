@@ -1,0 +1,15 @@
+# data
+data/
+
+# output results (keep folder, ignore contents)
+output/*
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
