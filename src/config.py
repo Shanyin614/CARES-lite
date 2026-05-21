@@ -61,6 +61,14 @@ def parse_args():
     # ── Misc ──────────────────────────────────
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--partition", type=str, default="manual",
+               choices=["manual", "dirichlet"])
+
+    p.add_argument("--num-true-clusters", type=int, default=10)
+    p.add_argument("--dir-alpha-inter", type=float, default=0.1,
+                help="Dirichlet alpha for inter-cluster label distributions")
+    p.add_argument("--dir-alpha-intra", type=float, default=10.0,
+                help="Dirichlet alpha for intra-cluster client distributions")
 
     args = p.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

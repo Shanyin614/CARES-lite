@@ -14,10 +14,16 @@ import pandas as pd
 from torchvision import datasets, transforms
 
 from src.config import parse_args
-from src.data import set_seed, get_device, build_client_metas
+
 from src.client import FLClient
 from src.server import FLServer
 
+from src.data import (
+    set_seed,
+    get_device,
+    build_client_metas,
+    build_dirichlet_client_metas,
+)
 
 def main():
     args = parse_args()
@@ -41,15 +47,31 @@ def main():
     )
 
     # ── 2. 构建 client metadata ──────────────────────────
-    metas, true_groups = build_client_metas(
-        train_dataset, test_dataset,
-        num_clients=args.num_clients,
-        train_samples=args.train_samples_per_client,
-        test_samples=args.test_samples_per_client,
-        major_ratio=args.major_ratio,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-    )
+    if args.partition == "dirichlet":
+        metas, true_groups = build_dirichlet_client_metas(
+            train_dataset,
+            test_dataset,
+            num_clients=args.num_clients,
+            train_samples=args.train_samples_per_client,
+            test_samples=args.test_samples_per_client,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+            num_clusters=args.num_true_clusters,
+            alpha_inter=args.dir_alpha_inter,
+            alpha_intra=args.dir_alpha_intra,
+        )
+    else:
+        metas, true_groups = build_client_metas(
+            train_dataset,
+            test_dataset,
+            num_clients=args.num_clients,
+            train_samples=args.train_samples_per_client,
+            test_samples=args.test_samples_per_client,
+            major_ratio=args.major_ratio,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+        )
+
 
     print("\nTrue groups (ground-truth, for evaluation only):")
     for gid, labels in enumerate(true_groups):
