@@ -10,7 +10,7 @@ Three-phase pipeline:
 """
 
 import copy
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -37,20 +37,19 @@ class FLServer:
         clients: List[FLClient],
         device: torch.device,
         seed: int,
+        model_fn: Callable[[], nn.Module] = SmallCNN,
     ):
         self.clients = clients
         self.device = device
         self.seed = seed
+        self.model_fn = model_fn
         self.rng = np.random.default_rng(seed)
         self.num_clients = len(clients)
 
-        # ── 运行时状态 ──
         self.global_model: Optional[nn.Module] = None
         self.cluster_models: Dict[int, nn.Module] = {}
         self.assignments: np.ndarray = np.zeros(self.num_clients, dtype=int)
         self.k_pred: int = 0
-
-        # 每个 client 的最新 loss profile
         self.client_profiles: Dict[int, np.ndarray] = {}
 
     # ══════════════════════════════════════════════════════
@@ -105,7 +104,7 @@ class FLServer:
             state = model_state_fn(i)
             rng_i = np.random.default_rng(self.seed + 9000 + i)
             profile = client.compute_loss_profile(
-                state, SmallCNN, M, sigma, rng_i,
+                state, self.model_fn, M, sigma, rng_i,
             )
             self.client_profiles[i] = profile
 
@@ -305,7 +304,7 @@ class FLServer:
         cluster_map = self._get_cluster_map()
         self.cluster_models = {}
         for gid in sorted(cluster_map):
-            model = SmallCNN()
+            model = self.model_fn()
             model.load_state_dict(
                 copy.deepcopy(self.global_model.state_dict())
             )
@@ -337,7 +336,7 @@ class FLServer:
                 fallback = next(iter(old_models.values()))
                 avg_state = copy.deepcopy(fallback.state_dict())
 
-            model = SmallCNN()
+            model = self.model_fn()
             model.load_state_dict(avg_state)
             new_models[new_gid] = model
 
@@ -495,7 +494,7 @@ class FLServer:
         print("=" * 55)
 
         set_seed(self.seed)
-        self.global_model = SmallCNN()
+        self.global_model = self.model_fn()
         print(f"  Global model initialized")
         print(f"  Total rounds: {total_rounds}")
         print(f"  Warm-up rounds: {warmup_rounds}")
@@ -524,13 +523,13 @@ class FLServer:
                     self.seed + 8000 * t + idx
                 )
                 profile = client.compute_loss_profile(
-                    global_state, SmallCNN,
+                    global_state, self.model_fn,
                     probe_pool_size, probe_sigma, rng_i,
                 )
                 self.client_profiles[idx] = profile
 
                 delta = client.local_train(
-                    global_state, SmallCNN, local_epochs, lr,
+                    global_state, self.model_fn, local_epochs, lr,
                 )
                 deltas.append(delta)
                 weights.append(client.num_train)
@@ -630,13 +629,13 @@ class FLServer:
                     self.seed + 8000 * t_global + idx
                 )
                 profile = client.compute_loss_profile(
-                    group_state, SmallCNN,
+                    group_state, self.model_fn,
                     probe_pool_size, probe_sigma, rng_i,
                 )
                 self.client_profiles[idx] = profile
 
                 delta = client.local_train(
-                    group_state, SmallCNN, local_epochs, lr,
+                    group_state, self.model_fn, local_epochs, lr,
                 )
                 group_deltas[gid][0].append(delta)
                 group_deltas[gid][1].append(client.num_train)
@@ -665,4 +664,3 @@ class FLServer:
 
         metrics = self.evaluate()
         return metrics
-

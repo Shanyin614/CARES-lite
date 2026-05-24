@@ -69,6 +69,7 @@ def parse_args():
                 help="Dirichlet alpha for inter-cluster label distributions")
     p.add_argument("--dir-alpha-intra", type=float, default=10.0,
                 help="Dirichlet alpha for intra-cluster client distributions")
+    p.add_argument("--dataset",type=str,default="fashionmnist",choices=["fashionmnist", "fmnist", "cifar10"],)
 
     args = p.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)

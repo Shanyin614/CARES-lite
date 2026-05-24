@@ -7,22 +7,35 @@ LAST_LAYER_PREFIX = "classifier.2"
 
 
 class SmallCNN(nn.Module):
-    """Lightweight CNN for 28×28 grayscale images (Fashion-MNIST)."""
+    """Lightweight CNN for FashionMNIST / CIFAR-10."""
 
-    def __init__(self, num_classes: int = 10):
+    def __init__(
+        self,
+        input_channels: int = 1,
+        image_size: int = 28,
+        num_classes: int = 10,
+    ):
         super().__init__()
+
+        if image_size % 4 != 0:
+            raise ValueError(f"image_size must be divisible by 4, got {image_size}")
+
         self.features = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),   # features.0
-            nn.ReLU(inplace=True),                         # features.1
-            nn.MaxPool2d(2),                               # features.2
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),   # features.3
-            nn.ReLU(inplace=True),                         # features.4
-            nn.MaxPool2d(2),                               # features.5
+            nn.Conv2d(input_channels, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
         )
+
+        feat_size = image_size // 4
+
         self.classifier = nn.Sequential(
-            nn.Linear(32 * 7 * 7, 128),                    # classifier.0
-            nn.ReLU(inplace=True),                         # classifier.1
-            nn.Linear(128, num_classes),                    # classifier.2 ← 最后一层
+            nn.Linear(32 * feat_size * feat_size, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
