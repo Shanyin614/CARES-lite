@@ -121,12 +121,14 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     device = get_device()
+
     print(f"Device: {device}")
 
     # ── 1. 加载数据集 ────────────────────────────────────
     train_dataset, test_dataset, input_channels, image_size, num_classes = load_datasets(args)
 
     dataset_name = getattr(args, "dataset", "fashionmnist").lower()
+
     print(f"\nDataset: {dataset_name}")
     print(f"  input_channels: {input_channels}")
     print(f"  image_size:      {image_size}")
@@ -181,6 +183,7 @@ def main():
         )
         for m in metas
     ]
+
     print(f"\nCreated {len(fl_clients)} FL clients")
 
     # ── 4. 构造模型工厂，并实例化 FLServer ───────────────
@@ -212,20 +215,50 @@ def main():
         client_frac=args.client_frac,
         local_epochs=args.local_epochs,
         lr=args.lr,
+
+        # New profiling-anchor arguments.
+        probe_anchor=args.probe_anchor,
+        anchor_ema_beta=args.anchor_ema_beta,
+        profile_during_training=args.profile_during_training,
     )
 
     # ── 5. 保存结果 ──────────────────────────────────────
     print("\n" + "=" * 55)
     print(" Final Results")
     print("=" * 55)
+
     for k, v in metrics.items():
         print(f"  {k}: {v}")
 
     output_path = Path(args.output_dir) / args.output_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df = pd.DataFrame([{"method": "CARES-Lite", **metrics}])
+    row = {
+        "method": "CARES-Lite",
+        "dataset": dataset_name,
+        "partition": args.partition,
+        "num_clients": args.num_clients,
+        "num_true_clusters": args.num_true_clusters,
+        "total_rounds": args.total_rounds,
+        "warmup_rounds": args.warmup_rounds,
+        "cluster_interval": args.cluster_interval,
+        "probe_pool_size": args.probe_pool_size,
+        "probe_sigma": args.probe_sigma,
+        "probe_anchor": args.probe_anchor,
+        "anchor_ema_beta": args.anchor_ema_beta,
+        "profile_during_training": args.profile_during_training,
+        "dpmm_max_components": args.dpmm_max_components,
+        "dpmm_prior": args.dpmm_prior,
+        "min_cluster_size": args.min_cluster_size,
+        "client_frac": args.client_frac,
+        "local_epochs": args.local_epochs,
+        "lr": args.lr,
+        **metrics,
+    }
+
+    df = pd.DataFrame([row])
     df.to_csv(output_path, index=False)
+
     print(f"\nSaved → {output_path}")
 
 
