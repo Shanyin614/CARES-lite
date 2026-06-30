@@ -41,3 +41,21 @@ class SmallCNN(nn.Module):
     def forward(self, x):
         x = self.features(x)
         return self.classifier(x.flatten(1))
+
+
+class TabularMLP(nn.Module):
+    """Lightweight MLP for tabular intrusion detection datasets."""
+
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, num_classes),
+        )
+
+    def forward(self, x):
+        return self.model(x.view(x.size(0), -1))

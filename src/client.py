@@ -27,9 +27,6 @@ from src.data import ClientMeta
 from src.model import LAST_LAYER_PREFIX
 
 
-NUM_CLASSES = 10
-
-
 class FLClient:
     """Represents a single federated learning participant."""
 
@@ -41,12 +38,14 @@ class FLClient:
         batch_size: int,
         num_workers: int,
         device: torch.device,
+        num_classes: int,
     ):
         self.id = meta.client_id
         self.group_id = meta.group_id
         self.device = device
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.num_classes = num_classes
 
         self.train_set = Subset(train_dataset, meta.train_indices)
         self.val_set = Subset(train_dataset, meta.val_indices)
@@ -86,17 +85,18 @@ class FLClient:
         M: int,
         sigma: float,
         rng: Any,
+        num_classes: int,
     ) -> List[Dict[str, torch.Tensor]]:
         """
         构造 M 个 probe 模型的 state_dict：
 
         Probe 0         : 原始模型 W(t)
-        Probe 1 ~ 10    : Class-Ablation —— 屏蔽 class c 的输出层权重
+        Probe 1 ~ class-ablation: 屏蔽 class c 的输出层权重
                           weight[c, :] = 0, bias[c] = -100
                           → 使 probe 对 class c "失明"
                           → 数据富含 class c 的 client loss 显著升高
 
-        Probe 11 ~ M-1  : 对所有浮点层添加确定性高斯噪声 N(0, σ²)
+        Probe next    : 对所有浮点层添加确定性高斯噪声 N(0, σ²)
                           → 所有 client 在同一 probe index 上使用相同噪声方向
                           → 保证 loss profile 的每一维可比较
 
@@ -109,13 +109,20 @@ class FLClient:
         # ── Probe 0: 原始模型 ──
         probes.append(copy.deepcopy(base_state))
 
-        # ── Probe 1 ~ min(M-1, NUM_CLASSES): Class-Ablation ──
-        n_ablation = min(M - 1, NUM_CLASSES)
+        # ── Probe 1 ~ min(M-1, num_classes): Class-Ablation ──
+        n_ablation = min(M - 1, num_classes)
         weight_key = LAST_LAYER_PREFIX + ".weight"
         bias_key = LAST_LAYER_PREFIX + ".bias"
 
         for c in range(n_ablation):
             perturbed = copy.deepcopy(base_state)
+
+            if weight_key not in perturbed:
+                weight_keys = [k for k in perturbed if k.endswith(".weight")]
+                if len(weight_keys) == 0:
+                    raise RuntimeError("Unable to find last linear layer for class-ablation probe")
+                weight_key = weight_keys[-1]
+                bias_key = weight_key.replace(".weight", ".bias")
 
             if weight_key in perturbed and c < perturbed[weight_key].shape[0]:
                 perturbed[weight_key][c, :] = 0.0
@@ -200,7 +207,13 @@ class FLClient:
         Returns:
             profile: shape (M,), 每个元素 = 该 probe 在 val set 上的 avg CE loss
         """
-        probe_states = self._build_probe_pool(base_state, M, sigma, rng)
+        probe_states = self._build_probe_pool(
+            base_state,
+            M,
+            sigma,
+            rng,
+            self.num_classes,
+        )
         profile = np.zeros(M, dtype=np.float32)
 
         val_loader = DataLoader(

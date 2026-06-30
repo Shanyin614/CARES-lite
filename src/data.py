@@ -24,7 +24,21 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ╔══════════════════════════════════════════════════════════╗
+class TabularDataset(Dataset):
+    """Simple tabular dataset wrapper for NumPy features and integer labels."""
+
+    def __init__(self, features: np.ndarray, labels: np.ndarray):
+        self.features = features.astype(np.float32)
+        self.targets = labels.astype(np.int64)
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.features[idx]), int(self.targets[idx])
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════════╗
 # ║  Client metadata                                         ║
 # ╚══════════════════════════════════════════════════════════╝
 
@@ -60,7 +74,8 @@ def label_to_indices(dataset: Dataset) -> Dict[int, np.ndarray]:
         targets = targets.cpu().numpy()
     else:
         targets = np.array(targets)
-    return {y: np.where(targets == y)[0] for y in range(10)}
+    labels = np.unique(targets)
+    return {int(y): np.where(targets == y)[0] for y in labels}
 
 
 def _sample_mixture(
@@ -70,14 +85,19 @@ def _sample_mixture(
     major_ratio: float,
     rng: np.random.Generator,
 ) -> List[int]:
-    bg = [y for y in range(10) if y not in major_labels]
+    major_labels = [y for y in major_labels if y in pools]
+    bg = [y for y in sorted(pools.keys()) if y not in major_labels]
     n_major = int(round(n * major_ratio))
 
     sampled: List[int] = []
     for _ in range(n_major):
+        if len(major_labels) == 0:
+            raise ValueError("No major labels available for _sample_mixture")
         y = int(rng.choice(major_labels))
         sampled.append(int(rng.choice(pools[y])))
     for _ in range(n - n_major):
+        if len(bg) == 0:
+            raise ValueError("No background labels available for _sample_mixture")
         y = int(rng.choice(bg))
         sampled.append(int(rng.choice(pools[y])))
 
@@ -107,13 +127,23 @@ def build_client_metas(
     train_pools = label_to_indices(train_dataset)
     test_pools = label_to_indices(test_dataset)
 
+    labels = sorted(train_pools.keys())
+    if all(y in train_pools for group in TRUE_GROUPS for y in group):
+        true_groups = TRUE_GROUPS
+    else:
+        num_groups = min(len(TRUE_GROUPS), len(labels))
+        if num_groups == 0:
+            raise ValueError("No labels found in training dataset for manual partitioning")
+        true_groups = [labels[i::num_groups] for i in range(num_groups)]
+
     metas: List[ClientMeta] = []
     for cid in range(num_clients):
-        gid = cid % len(TRUE_GROUPS)
+        gid = cid % len(true_groups)
 
         # 先采样完整的训练索引
+        major_labels = [y for y in true_groups[gid] if y in train_pools]
         all_train = _sample_mixture(
-            train_pools, TRUE_GROUPS[gid], train_samples, major_ratio, rng,
+            train_pools, major_labels, train_samples, major_ratio, rng,
         )
 
         # 拆分 train / val
@@ -122,7 +152,7 @@ def build_client_metas(
         train_indices = all_train[n_val:]
 
         test_indices = _sample_mixture(
-            test_pools, TRUE_GROUPS[gid], test_samples, major_ratio, rng,
+            test_pools, major_labels, test_samples, major_ratio, rng,
         )
 
         metas.append(ClientMeta(
@@ -133,7 +163,7 @@ def build_client_metas(
             test_indices=test_indices,
         ))
 
-    return metas, TRUE_GROUPS
+    return metas, true_groups
 def _sample_by_label_probs(
     pools: Dict[int, np.ndarray],
     probs: np.ndarray,
@@ -144,9 +174,10 @@ def _sample_by_label_probs(
     probs = probs / probs.sum()
 
     sampled: List[int] = []
-    labels = rng.choice(np.arange(10), size=n, p=probs)
+    labels = np.array(sorted(pools.keys()), dtype=int)
+    selected = rng.choice(labels, size=n, p=probs)
 
-    for y in labels:
+    for y in selected:
         sampled.append(int(rng.choice(pools[int(y)])))
 
     rng.shuffle(sampled)
@@ -182,9 +213,12 @@ def build_dirichlet_client_metas(
     train_pools = label_to_indices(train_dataset)
     test_pools = label_to_indices(test_dataset)
 
+    labels = np.array(sorted(train_pools.keys()), dtype=int)
+    num_labels = len(labels)
+
     # K ground-truth cluster-level label distributions
     cluster_priors = rng.dirichlet(
-        alpha=np.full(10, alpha_inter, dtype=np.float64),
+        alpha=np.full(num_labels, alpha_inter, dtype=np.float64),
         size=num_clusters,
     )
 
@@ -219,7 +253,7 @@ def build_dirichlet_client_metas(
 
     # 只是为了打印展示：每个真实簇 top-3 dominant labels
     true_groups = [
-        [int(x) for x in np.argsort(-cluster_priors[k])[:3]]
+        [int(labels[x]) for x in np.argsort(-cluster_priors[k])[:3]]
         for k in range(num_clusters)
     ]
 

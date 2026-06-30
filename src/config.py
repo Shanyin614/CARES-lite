@@ -24,8 +24,43 @@ def parse_args():
         "--dataset",
         type=str,
         default="fashionmnist",
-        choices=["fashionmnist", "fmnist", "cifar10"],
+        choices=["fashionmnist", "fmnist", "cifar10", "cicids2017", "unsw_nb15"],
         help="Dataset used in the experiment",
+    )
+
+    p.add_argument(
+        "--tabular-train-file",
+        type=str,
+        default="",
+        help="Path to a tabular training CSV file for tabular datasets",
+    )
+
+    p.add_argument(
+        "--tabular-test-file",
+        type=str,
+        default="",
+        help="Path to a tabular test CSV file for tabular datasets",
+    )
+
+    p.add_argument(
+        "--tabular-all-file",
+        type=str,
+        default="",
+        help="Path to a single tabular CSV file containing all examples",
+    )
+
+    p.add_argument(
+        "--tabular-label-column",
+        type=str,
+        default="",
+        help="Label column name for tabular datasets; default depends on dataset",
+    )
+
+    p.add_argument(
+        "--tabular-test-split",
+        type=float,
+        default=0.2,
+        help="Test split fraction when using a single tabular CSV file",
     )
 
     # ── Client data partition ─────────────────

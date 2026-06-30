@@ -490,7 +490,6 @@ class FLServer:
                     all_yt,
                     all_yp,
                     average="macro",
-                    labels=list(range(10)),
                     zero_division=0,
                 )
             ),
@@ -527,7 +526,6 @@ class FLServer:
                     all_yt,
                     all_yp,
                     average="macro",
-                    labels=list(range(10)),
                     zero_division=0,
                 )
             ),
@@ -605,10 +603,12 @@ class FLServer:
         print(f"  Total rounds: {total_rounds}")
         print(f"  Warm-up rounds: {warmup_rounds}")
         print(f"  Cluster interval τ: {cluster_interval}")
+        n_ablation = min(probe_pool_size - 1, self.clients[0].num_classes)
+
         print(f"  Probe pool M: {probe_pool_size}, σ: {probe_sigma}")
         print(
-            f"  Probes: 1 original + 10 class-ablation + "
-            f"{max(0, probe_pool_size - 11)} random"
+            f"  Probes: 1 original + {n_ablation} class-ablation + "
+            f"{max(0, probe_pool_size - 1 - n_ablation)} random"
         )
         print(f"  Probe anchor: {probe_anchor}")
 
