@@ -14,6 +14,8 @@ Three-phase pipeline:
   3. 保留 probe_anchor="assigned" 作为旧逻辑 ablation。
   4. 训练轮中默认不再计算 loss profile，只在 full profiling / re-clustering 时计算。
   5. 同一次 profiling 内所有 clients 共享相同 random probe seed，保证 profile 维度可比较。
+  6. 新增论文常用检测指标：ACC、Precision、Recall、F1。
+  7. Server 端模型与 anchor state 始终保留在 CPU，避免 CPU/CUDA 混用。
 """
 
 import copy
@@ -26,13 +28,15 @@ from sklearn.metrics import (
     adjusted_rand_score,
     f1_score,
     normalized_mutual_info_score,
+    precision_score,
+    recall_score,
 )
 from sklearn.mixture import BayesianGaussianMixture
 from sklearn.preprocessing import StandardScaler
 
+from src.client import FLClient
 from src.data import set_seed
 from src.model import SmallCNN
-from src.client import FLClient
 
 
 class FLServer:
@@ -54,16 +58,34 @@ class FLServer:
 
         self.global_model: Optional[nn.Module] = None
         self.cluster_models: Dict[int, nn.Module] = {}
-        self.assignments: np.ndarray = np.zeros(self.num_clients, dtype=int)
+
+        self.assignments = np.zeros(
+            self.num_clients,
+            dtype=int,
+        )
+
         self.k_pred: int = 0
         self.client_profiles: Dict[int, np.ndarray] = {}
 
         self.anchor_state: Optional[Dict[str, torch.Tensor]] = None
 
+    @staticmethod
+    def _state_to_cpu(
+        state: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Return a detached CPU copy of a state dictionary."""
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in state.items()
+        }
+
     def _select_clients(self, frac: float) -> List[int]:
         m = max(1, int(round(frac * self.num_clients)))
+
         return self.rng.choice(
-            self.num_clients, size=m, replace=False,
+            self.num_clients,
+            size=m,
+            replace=False,
         ).tolist()
 
     @staticmethod
@@ -71,17 +93,33 @@ class FLServer:
         deltas: List[Dict[str, torch.Tensor]],
         weights: List[int],
     ) -> Dict[str, torch.Tensor]:
+        """Weighted average of client deltas, always returned on CPU."""
+        if not deltas:
+            raise ValueError("Cannot aggregate an empty delta list.")
+
+        if len(deltas) != len(weights):
+            raise ValueError("deltas and weights must have equal length.")
+
         total = float(sum(weights))
+
+        if total <= 0:
+            raise ValueError("Sum of aggregation weights must be positive.")
+
+        cpu_deltas = [
+            FLServer._state_to_cpu(delta)
+            for delta in deltas
+        ]
+
         avg: Dict[str, torch.Tensor] = {}
 
-        for key in deltas[0]:
-            if torch.is_floating_point(deltas[0][key]):
+        for key in cpu_deltas[0]:
+            if torch.is_floating_point(cpu_deltas[0][key]):
                 avg[key] = sum(
-                    d[key].float() * (w / total)
-                    for d, w in zip(deltas, weights)
-                ).to(dtype=deltas[0][key].dtype)
+                    delta[key].float() * (weight / total)
+                    for delta, weight in zip(cpu_deltas, weights)
+                ).to(dtype=cpu_deltas[0][key].dtype)
             else:
-                avg[key] = torch.zeros_like(deltas[0][key])
+                avg[key] = torch.zeros_like(cpu_deltas[0][key])
 
         return avg
 
@@ -90,15 +128,20 @@ class FLServer:
         state: Dict[str, torch.Tensor],
         delta: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        new_state = copy.deepcopy(state)
+        """Apply a CPU delta to a CPU model state."""
+        state_cpu = FLServer._state_to_cpu(state)
+        delta_cpu = FLServer._state_to_cpu(delta)
+
+        new_state = copy.deepcopy(state_cpu)
 
         for key in new_state:
             if torch.is_floating_point(new_state[key]):
                 new_state[key] = (
-                    new_state[key].float() + delta[key].float()
-                ).to(dtype=state[key].dtype)
+                    state_cpu[key].float()
+                    + delta_cpu[key].float()
+                ).to(dtype=state_cpu[key].dtype)
             else:
-                new_state[key] = copy.deepcopy(state[key])
+                new_state[key] = state_cpu[key].clone()
 
         return new_state
 
@@ -115,7 +158,7 @@ class FLServer:
         )
 
         for i, client in enumerate(self.clients):
-            state = model_state_fn(i)
+            state = self._state_to_cpu(model_state_fn(i))
 
             profile = client.compute_loss_profile(
                 state,
@@ -124,6 +167,7 @@ class FLServer:
                 sigma,
                 probe_seed,
             )
+
             self.client_profiles[i] = profile
 
             if (i + 1) % 20 == 0:
@@ -136,28 +180,44 @@ class FLServer:
         Z = self._get_profile_matrix()
 
         print(f"\n  [Diagnostics] Profile matrix shape: {Z.shape}")
-        print(f"  [Diagnostics] Per-dimension stats (across clients):")
+        print("  [Diagnostics] Per-dimension stats (across clients):")
         print(f"    mean:  {Z.mean(axis=0)[:5].round(3)} ...")
         print(f"    std:   {Z.std(axis=0)[:5].round(3)} ...")
-        print(f"    range: {(Z.max(axis=0) - Z.min(axis=0))[:5].round(3)} ...")
+        print(
+            f"    range: "
+            f"{(Z.max(axis=0) - Z.min(axis=0))[:5].round(3)} ..."
+        )
 
         inter_client_std = Z.std(axis=0).mean()
         intra_client_std = Z.std(axis=1).mean()
 
-        print(f"  [Diagnostics] Avg inter-client std (across dims): {inter_client_std:.4f}")
-        print(f"  [Diagnostics] Avg intra-client std (across probes): {intra_client_std:.4f}")
+        print(
+            f"  [Diagnostics] Avg inter-client std (across dims): "
+            f"{inter_client_std:.4f}"
+        )
+        print(
+            f"  [Diagnostics] Avg intra-client std (across probes): "
+            f"{intra_client_std:.4f}"
+        )
 
         if inter_client_std < 0.01:
-            print("  ⚠️  WARNING: Inter-client std very low → probes may lack diversity!")
+            print(
+                "  WARNING: Inter-client std very low -> "
+                "probes may lack diversity!"
+            )
         else:
-            print("  ✅  Profile diversity looks reasonable")
+            print("  Profile diversity looks reasonable")
 
     def _get_profile_matrix(self) -> np.ndarray:
         M = len(next(iter(self.client_profiles.values())))
-        Z = np.zeros((self.num_clients, M), dtype=np.float32)
 
-        for i, prof in self.client_profiles.items():
-            Z[i] = prof
+        Z = np.zeros(
+            (self.num_clients, M),
+            dtype=np.float32,
+        )
+
+        for i, profile in self.client_profiles.items():
+            Z[i] = profile
 
         return Z
 
@@ -168,13 +228,20 @@ class FLServer:
         noise_sigma: float,
     ) -> np.ndarray:
         rng = np.random.default_rng(self.seed + 4000)
+
         R = Z.copy().astype(np.float32)
 
         mu = R.mean(axis=1, keepdims=True)
         std = R.std(axis=1, keepdims=True) + 1e-6
+
         R = (R - mu) / std
 
-        norms = np.linalg.norm(R, axis=1, keepdims=True) + 1e-12
+        norms = np.linalg.norm(
+            R,
+            axis=1,
+            keepdims=True,
+        ) + 1e-12
+
         R *= np.minimum(1.0, clip_norm / norms)
 
         if noise_sigma > 0:
@@ -216,6 +283,7 @@ class FLServer:
         cluster_map = self._get_cluster_map()
 
         centers: Dict[int, np.ndarray] = {}
+
         for gid, members in cluster_map.items():
             centers[gid] = profiles[members].mean(axis=0)
 
@@ -226,60 +294,87 @@ class FLServer:
             cluster_map = self._get_cluster_map()
 
             small_groups = [
-                g for g, m in cluster_map.items() if len(m) < min_size
+                gid
+                for gid, members in cluster_map.items()
+                if len(members) < min_size
             ]
+
             big_groups = [
-                g for g, m in cluster_map.items() if len(m) >= min_size
+                gid
+                for gid, members in cluster_map.items()
+                if len(members) >= min_size
             ]
 
             if not big_groups and small_groups:
-                biggest = max(small_groups, key=lambda g: len(cluster_map[g]))
-                big_groups = [biggest]
-                small_groups = [g for g in small_groups if g != biggest]
+                biggest = max(
+                    small_groups,
+                    key=lambda gid: len(cluster_map[gid]),
+                )
 
-            for sg in small_groups:
+                big_groups = [biggest]
+                small_groups = [
+                    gid
+                    for gid in small_groups
+                    if gid != biggest
+                ]
+
+            for small_gid in small_groups:
                 if not big_groups:
                     break
 
-                sg_center = centers.get(
-                    sg,
-                    profiles[cluster_map[sg]].mean(axis=0),
+                small_center = centers.get(
+                    small_gid,
+                    profiles[cluster_map[small_gid]].mean(axis=0),
                 )
 
-                dists = {
-                    bg: np.linalg.norm(
-                        sg_center
+                distances = {
+                    big_gid: np.linalg.norm(
+                        small_center
                         - centers.get(
-                            bg,
-                            profiles[cluster_map[bg]].mean(axis=0),
+                            big_gid,
+                            profiles[cluster_map[big_gid]].mean(axis=0),
                         )
                     )
-                    for bg in big_groups
+                    for big_gid in big_groups
                 }
 
-                nearest = min(dists, key=dists.get)
+                nearest_gid = min(distances, key=distances.get)
 
-                for i in cluster_map[sg]:
-                    self.assignments[i] = nearest
+                for client_idx in cluster_map[small_gid]:
+                    self.assignments[client_idx] = nearest_gid
 
                 changed = True
 
-                new_members = cluster_map[nearest] + cluster_map[sg]
-                centers[nearest] = profiles[new_members].mean(axis=0)
+                new_members = (
+                    cluster_map[nearest_gid]
+                    + cluster_map[small_gid]
+                )
+
+                centers[nearest_gid] = profiles[new_members].mean(axis=0)
 
         self._relabel_assignments()
         self.k_pred = int(len(np.unique(self.assignments)))
 
     def _relabel_assignments(self):
+        """Relabel cluster IDs to contiguous integers: 0, 1, 2, ..."""
         old_labels = sorted(np.unique(self.assignments).tolist())
-        mapping = {old: new for new, old in enumerate(old_labels)}
-        self.assignments = np.array([mapping[int(a)] for a in self.assignments])
+
+        mapping = {
+            old_label: new_label
+            for new_label, old_label in enumerate(old_labels)
+        }
+
+        self.assignments = np.array(
+            [mapping[int(label)] for label in self.assignments],
+            dtype=int,
+        )
 
     def _get_cluster_map(self) -> Dict[int, List[int]]:
+        """Return mapping: cluster_id -> list of client indices."""
         mapping: Dict[int, List[int]] = {}
 
-        for i, c in enumerate(self.assignments):
-            mapping.setdefault(int(c), []).append(i)
+        for client_idx, cluster_id in enumerate(self.assignments):
+            mapping.setdefault(int(cluster_id), []).append(client_idx)
 
         return mapping
 
@@ -293,68 +388,215 @@ class FLServer:
         """
         if not self.cluster_models:
             if self.global_model is None:
-                raise RuntimeError("No global model or cluster models available.")
-            return copy.deepcopy(self.global_model.state_dict())
+                raise RuntimeError(
+                    "No global model or cluster models available."
+                )
+
+            return self._state_to_cpu(self.global_model.state_dict())
 
         cluster_map = self._get_cluster_map()
+
         states: List[Dict[str, torch.Tensor]] = []
         weights: List[int] = []
 
         for gid, model in self.cluster_models.items():
-            n = len(cluster_map.get(int(gid), []))
-            if n <= 0:
+            n_clients = len(cluster_map.get(int(gid), []))
+
+            if n_clients <= 0:
                 continue
 
-            states.append(copy.deepcopy(model.state_dict()))
-            weights.append(n)
+            model.cpu()
+
+            states.append(
+                self._state_to_cpu(model.state_dict())
+            )
+
+            weights.append(n_clients)
 
         if not states:
             if self.global_model is None:
-                raise RuntimeError("No valid cluster states for anchor update.")
-            return copy.deepcopy(self.global_model.state_dict())
+                raise RuntimeError(
+                    "No valid cluster states for anchor update."
+                )
+
+            return self._state_to_cpu(self.global_model.state_dict())
 
         return self._weighted_avg_states(states, weights)
 
-    def _update_anchor_state(self, beta: float = 0.9) -> Dict[str, torch.Tensor]:
+
+    def _update_anchor_state(
+        self,
+        beta: float = 0.9,
+    ) -> Dict[str, torch.Tensor]:
         """
         EMA update of the global profiling anchor.
 
             anchor <- beta * anchor
                       + (1 - beta) * weighted_avg(cluster_models)
+
+        All anchor tensors are explicitly kept on CPU.
         """
-        new_anchor = self._weighted_avg_cluster_models()
+        new_anchor = self._state_to_cpu(
+            self._weighted_avg_cluster_models()
+        )
 
         if self.anchor_state is None:
             self.anchor_state = copy.deepcopy(new_anchor)
         else:
+            old_anchor = self._state_to_cpu(self.anchor_state)
+            updated_anchor: Dict[str, torch.Tensor] = {}
+
             for key in new_anchor:
                 if torch.is_floating_point(new_anchor[key]):
-                    self.anchor_state[key] = (
-                        beta * self.anchor_state[key].float()
+                    updated_anchor[key] = (
+                        beta * old_anchor[key].float()
                         + (1.0 - beta) * new_anchor[key].float()
                     ).to(dtype=new_anchor[key].dtype)
                 else:
-                    self.anchor_state[key] = copy.deepcopy(new_anchor[key])
+                    updated_anchor[key] = new_anchor[key].clone()
 
-        return copy.deepcopy(self.anchor_state)
+            self.anchor_state = updated_anchor
+
+        return self._state_to_cpu(self.anchor_state)
 
     def _get_probe_anchor_state(
         self,
         probe_anchor: str,
         anchor_ema_beta: float,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Return the base model used for dynamic re-clustering profiling.
-        """
+        """Return the base model used for re-clustering profiling."""
         if probe_anchor == "global":
-            return self._weighted_avg_cluster_models()
+            return self._state_to_cpu(
+                self._weighted_avg_cluster_models()
+            )
 
         if probe_anchor == "ema_global":
             if self.anchor_state is None:
-                return self._update_anchor_state(beta=anchor_ema_beta)
-            return copy.deepcopy(self.anchor_state)
+                return self._update_anchor_state(
+                    beta=anchor_ema_beta
+                )
+
+            return self._state_to_cpu(self.anchor_state)
 
         raise ValueError(f"Unsupported probe_anchor: {probe_anchor}")
+
+    @staticmethod
+    def _paper_classification_metrics(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        num_classes: int,
+    ) -> Dict[str, float]:
+        """
+        Compute paper-style classification metrics.
+
+        Binary NIDS:
+            normal = 0
+            attack = 1
+
+        ACC is overall accuracy.
+        Precision / Recall / F1 use attack class 1 as positive class.
+
+        For multiclass tasks:
+            Precision / Recall / F1 are macro-averaged.
+        """
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+
+        if y_true.size == 0:
+            return {
+                "acc": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "tn": 0,
+                "fp": 0,
+                "fn": 0,
+                "tp": 0,
+            }
+
+        acc = float((y_true == y_pred).mean())
+
+        if num_classes == 2:
+            pos_label = 1
+
+            precision = float(
+                precision_score(
+                    y_true,
+                    y_pred,
+                    pos_label=pos_label,
+                    average="binary",
+                    zero_division=0,
+                )
+            )
+
+            recall = float(
+                recall_score(
+                    y_true,
+                    y_pred,
+                    pos_label=pos_label,
+                    average="binary",
+                    zero_division=0,
+                )
+            )
+
+            f1 = float(
+                f1_score(
+                    y_true,
+                    y_pred,
+                    pos_label=pos_label,
+                    average="binary",
+                    zero_division=0,
+                )
+            )
+
+            y_true_pos = y_true == pos_label
+            y_pred_pos = y_pred == pos_label
+
+            tp = int(np.logical_and(y_true_pos, y_pred_pos).sum())
+            tn = int(np.logical_and(~y_true_pos, ~y_pred_pos).sum())
+            fp = int(np.logical_and(~y_true_pos, y_pred_pos).sum())
+            fn = int(np.logical_and(y_true_pos, ~y_pred_pos).sum())
+
+        else:
+            precision = float(
+                precision_score(
+                    y_true,
+                    y_pred,
+                    average="macro",
+                    zero_division=0,
+                )
+            )
+
+            recall = float(
+                recall_score(
+                    y_true,
+                    y_pred,
+                    average="macro",
+                    zero_division=0,
+                )
+            )
+
+            f1 = float(
+                f1_score(
+                    y_true,
+                    y_pred,
+                    average="macro",
+                    zero_division=0,
+                )
+            )
+
+            tn, fp, fn, tp = 0, 0, 0, 0
+
+        return {
+            "acc": acc,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "tn": tn,
+            "fp": fp,
+            "fn": fn,
+            "tp": tp,
+        }
 
     def _cluster_quality_metrics(self) -> Dict[str, float]:
         """
@@ -364,22 +606,35 @@ class FLServer:
         client.group_id is available. They are not used by CARES itself.
         """
         y_true = np.array(
-            [int(self.clients[i].group_id) for i in range(self.num_clients)],
+            [
+                int(self.clients[i].group_id)
+                for i in range(self.num_clients)
+            ],
             dtype=int,
         )
+
         y_pred = self.assignments.astype(int)
 
         ari = adjusted_rand_score(y_true, y_pred)
-        nmi = normalized_mutual_info_score(y_true, y_pred)
+
+        nmi = normalized_mutual_info_score(
+            y_true,
+            y_pred,
+        )
 
         purity_correct = 0
 
         for _, members in self._get_cluster_map().items():
             labels = y_true[members]
+
             if len(labels) == 0:
                 continue
 
-            _, counts = np.unique(labels, return_counts=True)
+            _, counts = np.unique(
+                labels,
+                return_counts=True,
+            )
+
             purity_correct += int(counts.max())
 
         purity = purity_correct / max(self.num_clients, 1)
@@ -391,14 +646,24 @@ class FLServer:
         }
 
     def _init_group_models(self):
+        """Initialize each cluster model from the warm-up global model."""
+        if self.global_model is None:
+            raise RuntimeError("Global model is not initialized.")
+
+        self.global_model.cpu()
+
+        global_state = self._state_to_cpu(
+            self.global_model.state_dict()
+        )
+
         cluster_map = self._get_cluster_map()
         self.cluster_models = {}
 
         for gid in sorted(cluster_map):
             model = self.model_fn()
-            model.load_state_dict(
-                copy.deepcopy(self.global_model.state_dict())
-            )
+            model.load_state_dict(copy.deepcopy(global_state))
+            model.cpu()
+
             self.cluster_models[gid] = model
 
         print(
@@ -406,34 +671,59 @@ class FLServer:
             f"from global model"
         )
 
-    def _reinit_group_models(self, old_assignments: np.ndarray):
-        old_models = copy.deepcopy(self.cluster_models)
+    def _reinit_group_models(
+        self,
+        old_assignments: np.ndarray,
+    ):
+        """Rebuild group models after dynamic re-clustering."""
+        old_model_states = {
+            gid: self._state_to_cpu(model.state_dict())
+            for gid, model in self.cluster_models.items()
+        }
+
         new_cluster_map = self._get_cluster_map()
         new_models: Dict[int, nn.Module] = {}
 
         for new_gid, member_ids in new_cluster_map.items():
             old_group_counts: Dict[int, int] = {}
 
-            for mid in member_ids:
-                old_g = int(old_assignments[mid])
-                old_group_counts[old_g] = old_group_counts.get(old_g, 0) + 1
+            for member_id in member_ids:
+                old_gid = int(old_assignments[member_id])
+
+                old_group_counts[old_gid] = (
+                    old_group_counts.get(old_gid, 0) + 1
+                )
 
             states: List[Dict[str, torch.Tensor]] = []
             weights: List[int] = []
 
-            for old_g, count in old_group_counts.items():
-                if old_g in old_models:
-                    states.append(old_models[old_g].state_dict())
+            for old_gid, count in old_group_counts.items():
+                if old_gid in old_model_states:
+                    states.append(old_model_states[old_gid])
                     weights.append(count)
 
             if states:
-                avg_state = self._weighted_avg_states(states, weights)
+                avg_state = self._weighted_avg_states(
+                    states,
+                    weights,
+                )
+            elif old_model_states:
+                avg_state = self._state_to_cpu(
+                    next(iter(old_model_states.values()))
+                )
+            elif self.global_model is not None:
+                avg_state = self._state_to_cpu(
+                    self.global_model.state_dict()
+                )
             else:
-                fallback = next(iter(old_models.values()))
-                avg_state = copy.deepcopy(fallback.state_dict())
+                raise RuntimeError(
+                    "Cannot initialize group models after re-clustering."
+                )
 
             model = self.model_fn()
             model.load_state_dict(avg_state)
+            model.cpu()
+
             new_models[new_gid] = model
 
         self.cluster_models = new_models
@@ -448,101 +738,285 @@ class FLServer:
         states: List[Dict[str, torch.Tensor]],
         weights: List[int],
     ) -> Dict[str, torch.Tensor]:
+        """Weighted average of model state dicts, returned on CPU."""
+        if not states:
+            raise ValueError("Cannot average an empty state list.")
+
+        if len(states) != len(weights):
+            raise ValueError("states and weights must have equal length.")
+
         total = float(sum(weights))
-        avg = copy.deepcopy(states[0])
+
+        if total <= 0:
+            raise ValueError("Sum of state weights must be positive.")
+
+        cpu_states = [
+            FLServer._state_to_cpu(state)
+            for state in states
+        ]
+
+        avg = copy.deepcopy(cpu_states[0])
 
         for key in avg:
             if torch.is_floating_point(avg[key]):
                 avg[key] = sum(
-                    s[key].float() * (w / total)
-                    for s, w in zip(states, weights)
-                ).to(dtype=states[0][key].dtype)
+                    state[key].float() * (weight / total)
+                    for state, weight in zip(cpu_states, weights)
+                ).to(dtype=cpu_states[0][key].dtype)
             else:
-                avg[key] = copy.deepcopy(states[0][key])
+                avg[key] = cpu_states[0][key].clone()
 
         return avg
 
     def evaluate_global_model(self) -> Dict[str, float]:
         """Evaluate the warm-up global model before clustering."""
-        accs, f1s = [], []
-        all_yt, all_yp = [], []
-        total_correct, total_n = 0, 0
+        if self.global_model is None:
+            raise RuntimeError("Global model is not initialized.")
+
+        accs = []
+        macro_f1s = []
+        client_precisions = []
+        client_recalls = []
+        client_f1s = []
+
+        all_y_true = []
+        all_y_pred = []
+
+        total_correct = 0
+        total_n = 0
+
+        num_classes = self.clients[0].num_classes if self.clients else 2
 
         for client in self.clients:
-            yt, yp = client.evaluate(self.global_model)
-            correct = int((yt == yp).sum())
-            n = len(yt)
+            y_true, y_pred = client.evaluate(self.global_model)
 
-            accs.append(correct / max(n, 1))
-            f1s.append(f1_score(yt, yp, average="macro", zero_division=0))
+            n_samples = len(y_true)
+            correct = int((y_true == y_pred).sum())
 
-            all_yt.extend(yt.tolist())
-            all_yp.extend(yp.tolist())
-            total_correct += correct
-            total_n += n
+            client_metrics = self._paper_classification_metrics(
+                y_true,
+                y_pred,
+                num_classes=num_classes,
+            )
 
-        return {
-            "client_avg_acc": float(np.mean(accs)),
-            "micro_acc": float(total_correct / max(total_n, 1)),
-            "client_avg_macro_f1": float(np.mean(f1s)),
-            "global_macro_f1": float(
+            accs.append(client_metrics["acc"])
+            client_precisions.append(client_metrics["precision"])
+            client_recalls.append(client_metrics["recall"])
+            client_f1s.append(client_metrics["f1"])
+
+            macro_f1s.append(
                 f1_score(
-                    all_yt,
-                    all_yp,
+                    y_true,
+                    y_pred,
                     average="macro",
                     zero_division=0,
                 )
+                if n_samples > 0
+                else 0.0
+            )
+
+            all_y_true.extend(y_true.tolist())
+            all_y_pred.extend(y_pred.tolist())
+
+            total_correct += correct
+            total_n += n_samples
+
+        all_y_true_arr = np.asarray(all_y_true)
+        all_y_pred_arr = np.asarray(all_y_pred)
+
+        paper_metrics = self._paper_classification_metrics(
+            all_y_true_arr,
+            all_y_pred_arr,
+            num_classes=num_classes,
+        )
+
+        global_macro_f1 = (
+            float(
+                f1_score(
+                    all_y_true_arr,
+                    all_y_pred_arr,
+                    average="macro",
+                    zero_division=0,
+                )
+            )
+            if total_n > 0
+            else 0.0
+        )
+
+        return {
+            # Paper metrics: pooled globally across every client test sample.
+            "acc": paper_metrics["acc"],
+            "precision": paper_metrics["precision"],
+            "recall": paper_metrics["recall"],
+            "f1": paper_metrics["f1"],
+
+            # Binary confusion matrix.
+            "tn": paper_metrics["tn"],
+            "fp": paper_metrics["fp"],
+            "fn": paper_metrics["fn"],
+            "tp": paper_metrics["tp"],
+
+            # Original metrics kept for compatibility.
+            "client_avg_acc": float(np.mean(accs)) if accs else 0.0,
+            "micro_acc": float(total_correct / max(total_n, 1)),
+            "client_avg_macro_f1": (
+                float(np.mean(macro_f1s))
+                if macro_f1s
+                else 0.0
+            ),
+            "global_macro_f1": global_macro_f1,
+
+            # Optional client-average paper metrics.
+            "client_avg_precision": (
+                float(np.mean(client_precisions))
+                if client_precisions
+                else 0.0
+            ),
+            "client_avg_recall": (
+                float(np.mean(client_recalls))
+                if client_recalls
+                else 0.0
+            ),
+            "client_avg_f1": (
+                float(np.mean(client_f1s))
+                if client_f1s
+                else 0.0
             ),
         }
 
     def evaluate(self) -> Dict[str, float]:
-        accs, f1s = [], []
-        all_yt, all_yp = [], []
-        total_correct, total_n = 0, 0
+        """Evaluate clustered models on all client test sets."""
+        accs = []
+        macro_f1s = []
+        client_precisions = []
+        client_recalls = []
+        client_f1s = []
+
+        all_y_true = []
+        all_y_pred = []
+
+        total_correct = 0
+        total_n = 0
+
+        num_classes = self.clients[0].num_classes if self.clients else 2
 
         for i, client in enumerate(self.clients):
             gid = int(self.assignments[i])
             model = self.cluster_models[gid]
-            yt, yp = client.evaluate(model)
 
-            correct = int((yt == yp).sum())
-            n = len(yt)
+            y_true, y_pred = client.evaluate(model)
 
-            accs.append(correct / max(n, 1))
-            f1s.append(f1_score(yt, yp, average="macro", zero_division=0))
+            n_samples = len(y_true)
+            correct = int((y_true == y_pred).sum())
 
-            all_yt.extend(yt.tolist())
-            all_yp.extend(yp.tolist())
-            total_correct += correct
-            total_n += n
+            client_metrics = self._paper_classification_metrics(
+                y_true,
+                y_pred,
+                num_classes=num_classes,
+            )
 
-        metrics = {
-            "k_pred": self.k_pred,
-            "client_avg_acc": float(np.mean(accs)),
-            "micro_acc": float(total_correct / max(total_n, 1)),
-            "client_avg_macro_f1": float(np.mean(f1s)),
-            "global_macro_f1": float(
+            accs.append(client_metrics["acc"])
+            client_precisions.append(client_metrics["precision"])
+            client_recalls.append(client_metrics["recall"])
+            client_f1s.append(client_metrics["f1"])
+
+            macro_f1s.append(
                 f1_score(
-                    all_yt,
-                    all_yp,
+                    y_true,
+                    y_pred,
                     average="macro",
                     zero_division=0,
                 )
+                if n_samples > 0
+                else 0.0
+            )
+
+            all_y_true.extend(y_true.tolist())
+            all_y_pred.extend(y_pred.tolist())
+
+            total_correct += correct
+            total_n += n_samples
+
+        all_y_true_arr = np.asarray(all_y_true)
+        all_y_pred_arr = np.asarray(all_y_pred)
+
+        paper_metrics = self._paper_classification_metrics(
+            all_y_true_arr,
+            all_y_pred_arr,
+            num_classes=num_classes,
+        )
+
+        global_macro_f1 = (
+            float(
+                f1_score(
+                    all_y_true_arr,
+                    all_y_pred_arr,
+                    average="macro",
+                    zero_division=0,
+                )
+            )
+            if total_n > 0
+            else 0.0
+        )
+
+        metrics = {
+            "k_pred": self.k_pred,
+
+            # Paper metrics: pooled globally across every client test sample.
+            "acc": paper_metrics["acc"],
+            "precision": paper_metrics["precision"],
+            "recall": paper_metrics["recall"],
+            "f1": paper_metrics["f1"],
+
+            # Binary confusion matrix.
+            "tn": paper_metrics["tn"],
+            "fp": paper_metrics["fp"],
+            "fn": paper_metrics["fn"],
+            "tp": paper_metrics["tp"],
+
+            # Original metrics kept for compatibility.
+            "client_avg_acc": float(np.mean(accs)) if accs else 0.0,
+            "micro_acc": float(total_correct / max(total_n, 1)),
+            "client_avg_macro_f1": (
+                float(np.mean(macro_f1s))
+                if macro_f1s
+                else 0.0
+            ),
+            "global_macro_f1": global_macro_f1,
+
+            # Optional client-average paper metrics.
+            "client_avg_precision": (
+                float(np.mean(client_precisions))
+                if client_precisions
+                else 0.0
+            ),
+            "client_avg_recall": (
+                float(np.mean(client_recalls))
+                if client_recalls
+                else 0.0
+            ),
+            "client_avg_f1": (
+                float(np.mean(client_f1s))
+                if client_f1s
+                else 0.0
             ),
         }
 
         metrics.update(self._cluster_quality_metrics())
+
         return metrics
 
     def _print_eval_snapshot(self, tag: str):
-        """Print a lightweight evaluation snapshot during training."""
+        """Print an evaluation snapshot during clustered training."""
         metrics = self.evaluate()
 
         print(
             f"  [Eval:{tag}] "
             f"K={metrics['k_pred']} | "
-            f"MicroAcc={metrics['micro_acc']:.4f} | "
-            f"ClientAvgAcc={metrics['client_avg_acc']:.4f} | "
+            f"ACC={metrics['acc']:.4f} | "
+            f"Precision={metrics['precision']:.4f} | "
+            f"Recall={metrics['recall']:.4f} | "
+            f"F1={metrics['f1']:.4f} | "
             f"GlobalMacroF1={metrics['global_macro_f1']:.4f} | "
             f"ClientAvgMacroF1={metrics['client_avg_macro_f1']:.4f} | "
             f"ARI={metrics.get('ari', float('nan')):.4f} | "
@@ -553,18 +1027,27 @@ class FLServer:
     def _print_cluster_info(self):
         print(f"  [Server] K = {self.k_pred}")
 
-        for c, members in sorted(self._get_cluster_map().items()):
+        for cluster_id, members in sorted(
+            self._get_cluster_map().items()
+        ):
             group_counts: Dict[int, int] = {}
 
-            for i in members:
-                g = self.clients[i].group_id
-                group_counts[g] = group_counts.get(g, 0) + 1
+            for client_idx in members:
+                group_id = self.clients[client_idx].group_id
+
+                group_counts[group_id] = (
+                    group_counts.get(group_id, 0) + 1
+                )
 
             group_str = ", ".join(
-                f"G{g}:{n}" for g, n in sorted(group_counts.items())
+                f"G{group_id}:{count}"
+                for group_id, count in sorted(group_counts.items())
             )
 
-            print(f"    cluster {c}: {len(members)} clients [{group_str}]")
+            print(
+                f"    cluster {cluster_id}: "
+                f"{len(members)} clients [{group_str}]"
+            )
 
     def run(
         self,
@@ -591,31 +1074,54 @@ class FLServer:
         print(" Phase 0: Initialization")
         print("=" * 55)
 
-        if probe_anchor not in {"assigned", "global", "ema_global"}:
+        if probe_anchor not in {
+            "assigned",
+            "global",
+            "ema_global",
+        }:
             raise ValueError(
-                "probe_anchor must be one of: assigned, global, ema_global"
+                "probe_anchor must be one of: "
+                "assigned, global, ema_global"
             )
 
-        set_seed(self.seed)
-        self.global_model = self.model_fn()
+        if cluster_interval <= 0:
+            raise ValueError("cluster_interval must be positive.")
 
-        print(f"  Global model initialized")
+        set_seed(self.seed)
+
+        # Server-side global model is intentionally stored on CPU.
+        self.global_model = self.model_fn()
+        self.global_model.cpu()
+
+        print("  Global model initialized")
         print(f"  Total rounds: {total_rounds}")
         print(f"  Warm-up rounds: {warmup_rounds}")
-        print(f"  Cluster interval τ: {cluster_interval}")
-        n_ablation = min(probe_pool_size - 1, self.clients[0].num_classes)
+        print(f"  Cluster interval tau: {cluster_interval}")
 
-        print(f"  Probe pool M: {probe_pool_size}, σ: {probe_sigma}")
+        n_ablation = min(
+            probe_pool_size - 1,
+            self.clients[0].num_classes,
+        )
+
+        print(
+            f"  Probe pool M: {probe_pool_size}, "
+            f"sigma: {probe_sigma}"
+        )
+
         print(
             f"  Probes: 1 original + {n_ablation} class-ablation + "
             f"{max(0, probe_pool_size - 1 - n_ablation)} random"
         )
+
         print(f"  Probe anchor: {probe_anchor}")
 
         if probe_anchor == "ema_global":
             print(f"  Anchor EMA beta: {anchor_ema_beta}")
 
-        print(f"  Profile during training rounds: {profile_during_training}")
+        print(
+            f"  Profile during training rounds: "
+            f"{profile_during_training}"
+        )
 
         print("\n" + "=" * 55)
         print(" Phase 1: Warm-up Global FedAvg")
@@ -623,9 +1129,13 @@ class FLServer:
 
         for t in range(warmup_rounds):
             selected = self._select_clients(client_frac)
-            global_state = copy.deepcopy(self.global_model.state_dict())
 
-            deltas, weights = [], []
+            global_state = self._state_to_cpu(
+                self.global_model.state_dict()
+            )
+
+            deltas: List[Dict[str, torch.Tensor]] = []
+            weights: List[int] = []
 
             for idx in selected:
                 client = self.clients[idx]
@@ -638,6 +1148,7 @@ class FLServer:
                         probe_sigma,
                         self.seed + 8000 * t,
                     )
+
                     self.client_profiles[idx] = profile
 
                 delta = client.local_train(
@@ -650,13 +1161,17 @@ class FLServer:
                 deltas.append(delta)
                 weights.append(client.num_train)
 
-            avg_delta = self._aggregate_deltas(deltas, weights)
+            avg_delta = self._aggregate_deltas(
+                deltas,
+                weights,
+            )
 
             new_state = self._apply_delta(
-                self.global_model.state_dict(),
+                global_state,
                 avg_delta,
             )
 
+            self.global_model.cpu()
             self.global_model.load_state_dict(new_state)
 
             print(
@@ -668,8 +1183,10 @@ class FLServer:
 
             print(
                 f"  [Eval:Warmup R{t + 1}] "
-                f"MicroAcc={warm_metrics['micro_acc']:.4f} | "
-                f"ClientAvgAcc={warm_metrics['client_avg_acc']:.4f} | "
+                f"ACC={warm_metrics['acc']:.4f} | "
+                f"Precision={warm_metrics['precision']:.4f} | "
+                f"Recall={warm_metrics['recall']:.4f} | "
+                f"F1={warm_metrics['f1']:.4f} | "
                 f"GlobalMacroF1={warm_metrics['global_macro_f1']:.4f}"
             )
 
@@ -678,7 +1195,7 @@ class FLServer:
         print("=" * 55)
 
         self._full_profiling(
-            model_state_fn=lambda _: copy.deepcopy(
+            model_state_fn=lambda _: self._state_to_cpu(
                 self.global_model.state_dict()
             ),
             M=probe_pool_size,
@@ -687,15 +1204,34 @@ class FLServer:
         )
 
         Z = self._get_profile_matrix()
-        profiles_normed = self._normalize_profiles(Z, clip_norm, noise_sigma)
 
-        self._run_dpmm(profiles_normed, dpmm_max_comp, dpmm_prior)
-        self._merge_small_clusters(min_cluster_size, profiles_normed)
+        profiles_normed = self._normalize_profiles(
+            Z,
+            clip_norm,
+            noise_sigma,
+        )
+
+        self._run_dpmm(
+            profiles_normed,
+            dpmm_max_comp,
+            dpmm_prior,
+        )
+
+        self._merge_small_clusters(
+            min_cluster_size,
+            profiles_normed,
+        )
+
         self._print_cluster_info()
         self._init_group_models()
 
-        self.anchor_state = copy.deepcopy(self.global_model.state_dict())
-        print("  [Server] Anchor model initialized from warm-up global model")
+        self.anchor_state = self._state_to_cpu(
+            self.global_model.state_dict()
+        )
+
+        print(
+            "  [Server] Anchor model initialized from warm-up global model"
+        )
 
         print("\n" + "=" * 55)
         print(" Phase 2: Clustered FedAvg with Dynamic Re-clustering")
@@ -707,15 +1243,20 @@ class FLServer:
             t_global = warmup_rounds + t_c
 
             if t_c > 0 and t_c % cluster_interval == 0:
-                print(f"\n  [Server] Re-clustering at round {t_global + 1} ...")
+                print(
+                    f"\n  [Server] Re-clustering at round "
+                    f"{t_global + 1} ..."
+                )
 
                 old_assignments = self.assignments.copy()
 
                 if probe_anchor == "assigned":
-                    print("  [Server] Profiling base: assigned group models")
+                    print(
+                        "  [Server] Profiling base: assigned group models"
+                    )
 
                     self._full_profiling(
-                        model_state_fn=lambda i: copy.deepcopy(
+                        model_state_fn=lambda i: self._state_to_cpu(
                             self.cluster_models[
                                 int(self.assignments[i])
                             ].state_dict()
@@ -727,7 +1268,8 @@ class FLServer:
 
                 else:
                     print(
-                        f"  [Server] Profiling base: {probe_anchor} anchor model"
+                        f"  [Server] Profiling base: "
+                        f"{probe_anchor} anchor model"
                     )
 
                     anchor_state = self._get_probe_anchor_state(
@@ -736,38 +1278,57 @@ class FLServer:
                     )
 
                     self._full_profiling(
-                        model_state_fn=lambda _: copy.deepcopy(anchor_state),
+                        model_state_fn=lambda _: self._state_to_cpu(
+                            anchor_state
+                        ),
                         M=probe_pool_size,
                         sigma=probe_sigma,
                         probe_seed=self.seed + 9100 + t_global,
                     )
 
                 Z = self._get_profile_matrix()
+
                 profiles_normed = self._normalize_profiles(
                     Z,
                     clip_norm,
                     noise_sigma,
                 )
 
-                self._run_dpmm(profiles_normed, dpmm_max_comp, dpmm_prior)
-                self._merge_small_clusters(min_cluster_size, profiles_normed)
+                self._run_dpmm(
+                    profiles_normed,
+                    dpmm_max_comp,
+                    dpmm_prior,
+                )
+
+                self._merge_small_clusters(
+                    min_cluster_size,
+                    profiles_normed,
+                )
+
                 self._print_cluster_info()
+
                 self._reinit_group_models(old_assignments)
 
                 if probe_anchor == "ema_global":
-                    self._update_anchor_state(beta=anchor_ema_beta)
+                    self._update_anchor_state(
+                        beta=anchor_ema_beta
+                    )
 
             selected = self._select_clients(client_frac)
 
             group_deltas: Dict[int, Tuple[List, List]] = {
-                g: ([], []) for g in self.cluster_models
+                gid: ([], [])
+                for gid in self.cluster_models
             }
 
             for idx in selected:
                 client = self.clients[idx]
+
                 gid = int(self.assignments[idx])
 
-                group_state = copy.deepcopy(
+                self.cluster_models[gid].cpu()
+
+                group_state = self._state_to_cpu(
                     self.cluster_models[gid].state_dict()
                 )
 
@@ -779,6 +1340,7 @@ class FLServer:
                         probe_sigma,
                         self.seed + 8000 * t_global,
                     )
+
                     self.client_profiles[idx] = profile
 
                 delta = client.local_train(
@@ -792,31 +1354,46 @@ class FLServer:
                 group_deltas[gid][1].append(client.num_train)
 
             for gid in self.cluster_models:
-                g_deltas, g_weights = group_deltas[gid]
+                group_delta_list, group_weight_list = group_deltas[gid]
 
-                if g_deltas:
-                    avg_delta = self._aggregate_deltas(g_deltas, g_weights)
+                if not group_delta_list:
+                    continue
 
-                    new_state = self._apply_delta(
-                        self.cluster_models[gid].state_dict(),
-                        avg_delta,
-                    )
+                avg_delta = self._aggregate_deltas(
+                    group_delta_list,
+                    group_weight_list,
+                )
 
-                    self.cluster_models[gid].load_state_dict(new_state)
+                self.cluster_models[gid].cpu()
+
+                old_group_state = self._state_to_cpu(
+                    self.cluster_models[gid].state_dict()
+                )
+
+                new_group_state = self._apply_delta(
+                    old_group_state,
+                    avg_delta,
+                )
+
+                self.cluster_models[gid].load_state_dict(
+                    new_group_state
+                )
 
             if probe_anchor == "ema_global":
                 self._update_anchor_state(beta=anchor_ema_beta)
 
             if (t_c + 1) % 5 == 0 or t_c == 0:
                 print(
-                    f"  [Clustered] Round {t_global + 1}/{total_rounds} done "
-                    f"(selected {len(selected)} clients)"
+                    f"  [Clustered] Round {t_global + 1}/{total_rounds} "
+                    f"done (selected {len(selected)} clients)"
                 )
-                self._print_eval_snapshot(f"R{t_global + 1}")
+
+                self._print_eval_snapshot(
+                    f"R{t_global + 1}"
+                )
 
         print("\n" + "=" * 55)
         print(" Evaluation")
         print("=" * 55)
 
-        metrics = self.evaluate()
-        return metrics
+        return self.evaluate()

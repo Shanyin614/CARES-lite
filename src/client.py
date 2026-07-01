@@ -1,18 +1,4 @@
-"""
-Federated Client (CARES-Lite)
-==============================
-每个 Client 暴露三个接口给 Server：
-
-  1. compute_loss_profile()  — 基于当前模型构造 probe pool，在 val set 上计算 loss 向量
-  2. local_train()           — 本地 SGD，返回模型增量 Δw
-  3. evaluate()              — 在本地 test set 上推理
-
-修改点：
-  1. Random probe 的噪声方向改为确定性生成。
-  2. Random probe 只扰动浮点参数 / buffer，避免 BatchNorm integer buffer 报错。
-  3. 保持与旧版 server.py 兼容：compute_loss_profile() 仍然接收 rng 参数。
-  4. 若 server 传入 int，则该 int 作为 probe_seed；若仍传 np.random.Generator，则默认使用固定 seed=0。
-"""
+"""Federated Client for CARES-Lite."""
 
 import copy
 from typing import Any, Dict, List, Tuple
@@ -24,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from src.data import ClientMeta
-from src.model import LAST_LAYER_PREFIX
+from src.model import get_last_linear_keys
 
 
 class FLClient:
@@ -52,32 +38,28 @@ class FLClient:
         self.test_set = Subset(test_dataset, meta.test_indices)
         self.num_train = len(meta.train_indices)
 
-    # ─────────────────────────────────────────────────────
-    #  Probe seed helper
-    # ─────────────────────────────────────────────────────
+    @staticmethod
+    def _state_to_cpu(
+        state: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Return a detached CPU copy of a state dict."""
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in state.items()
+        }
 
     @staticmethod
     def _resolve_probe_seed(seed_like: Any) -> int:
-        """
-        Resolve the seed used by random probes.
+        """Resolve the seed used by random probes.
 
         Backward compatibility:
-          - If server passes an int, use it as probe_seed.
-          - If server still passes np.random.Generator, do NOT sample from it.
-            We use a fixed seed so that all clients share the same random
-            perturbation directions for each probe dimension.
-
-        Later, server.py can explicitly pass a shared int seed per profiling
-        event to vary random probes across re-clustering rounds.
+        - If server passes an int, use it as probe_seed.
+        - If server still passes np.random.Generator, use a fixed seed so that
+          all clients share the same perturbation directions for each probe.
         """
         if isinstance(seed_like, (int, np.integer)):
             return int(seed_like)
-
         return 0
-
-    # ─────────────────────────────────────────────────────
-    #  Probe Pool 构造（Class-Ablation + Random Perturbation）
-    # ─────────────────────────────────────────────────────
 
     @staticmethod
     def _build_probe_pool(
@@ -87,52 +69,33 @@ class FLClient:
         rng: Any,
         num_classes: int,
     ) -> List[Dict[str, torch.Tensor]]:
+        """Construct M probe states.
+
+        Probe 0 is the original model. The next probes are class-ablation probes
+        on the final linear layer. Remaining probes add deterministic Gaussian
+        perturbations to floating-point parameters/buffers.
         """
-        构造 M 个 probe 模型的 state_dict：
+        base_state = FLClient._state_to_cpu(base_state)
 
-        Probe 0         : 原始模型 W(t)
-        Probe 1 ~ class-ablation: 屏蔽 class c 的输出层权重
-                          weight[c, :] = 0, bias[c] = -100
-                          → 使 probe 对 class c "失明"
-                          → 数据富含 class c 的 client loss 显著升高
-
-        Probe next    : 对所有浮点层添加确定性高斯噪声 N(0, σ²)
-                          → 所有 client 在同一 probe index 上使用相同噪声方向
-                          → 保证 loss profile 的每一维可比较
-
-        这种结构化 probe 使得 loss profile 能反映 client 的 label 分布差异，
-        从而让 DPMM 可以准确区分不同数据分布的 client。
-        """
         probes: List[Dict[str, torch.Tensor]] = []
         probe_seed = FLClient._resolve_probe_seed(rng)
 
-        # ── Probe 0: 原始模型 ──
         probes.append(copy.deepcopy(base_state))
 
-        # ── Probe 1 ~ min(M-1, num_classes): Class-Ablation ──
         n_ablation = min(M - 1, num_classes)
-        weight_key = LAST_LAYER_PREFIX + ".weight"
-        bias_key = LAST_LAYER_PREFIX + ".bias"
+        weight_key, bias_key = get_last_linear_keys(base_state)
 
         for c in range(n_ablation):
             perturbed = copy.deepcopy(base_state)
 
-            if weight_key not in perturbed:
-                weight_keys = [k for k in perturbed if k.endswith(".weight")]
-                if len(weight_keys) == 0:
-                    raise RuntimeError("Unable to find last linear layer for class-ablation probe")
-                weight_key = weight_keys[-1]
-                bias_key = weight_key.replace(".weight", ".bias")
-
-            if weight_key in perturbed and c < perturbed[weight_key].shape[0]:
+            if c < perturbed[weight_key].shape[0]:
                 perturbed[weight_key][c, :] = 0.0
 
-            if bias_key in perturbed and c < perturbed[bias_key].shape[0]:
+            if bias_key is not None and c < perturbed[bias_key].shape[0]:
                 perturbed[bias_key][c] = -100.0
 
             probes.append(perturbed)
 
-        # ── Probe (n_ablation+1) ~ M-1: 全层确定性随机扰动 ──
         n_random = M - 1 - n_ablation
 
         for r in range(n_random):
@@ -141,12 +104,9 @@ class FLClient:
             for key_idx, key in enumerate(perturbed):
                 tensor = perturbed[key]
 
-                # 只扰动浮点参数 / buffer。
-                # 例如 BatchNorm 的 num_batches_tracked 是整数 buffer，不能加高斯噪声。
                 if not torch.is_floating_point(tensor):
                     continue
 
-                # 使用 CPU generator，避免不同 device 上 Generator 行为不一致。
                 gen = torch.Generator(device="cpu")
                 gen.manual_seed(probe_seed + 1009 * r + 9176 * key_idx)
 
@@ -167,10 +127,6 @@ class FLClient:
 
         return probes
 
-    # ─────────────────────────────────────────────────────
-    #  Loss profiling
-    # ─────────────────────────────────────────────────────
-
     @torch.no_grad()
     def compute_loss_profile(
         self,
@@ -180,33 +136,9 @@ class FLClient:
         sigma: float,
         rng: Any,
     ) -> np.ndarray:
-        """
-        Server 下发当前模型参数 base_state →
-        Client 本地构造 M 个 probe (class-ablation + random) →
-        在本地 val set 上计算 M 维 loss 向量 →
-        上传该向量。
+        """Compute a local validation loss vector over the probe pool."""
+        base_state = self._state_to_cpu(base_state)
 
-        Args:
-            base_state:
-                用于构造 probe pool 的基模型参数。
-
-            model_cls:
-                模型构造函数 / 类。
-
-            M:
-                probe pool size。
-
-            sigma:
-                random perturbation probe 的高斯噪声标准差。
-
-            rng:
-                兼容旧版接口。
-                可以传 np.random.Generator，也可以传 int probe_seed。
-                推荐后续 server.py 显式传入同一个 int probe_seed。
-
-        Returns:
-            profile: shape (M,), 每个元素 = 该 probe 在 val set 上的 avg CE loss
-        """
         probe_states = self._build_probe_pool(
             base_state,
             M,
@@ -214,6 +146,7 @@ class FLClient:
             rng,
             self.num_classes,
         )
+
         profile = np.zeros(M, dtype=np.float32)
 
         val_loader = DataLoader(
@@ -227,15 +160,20 @@ class FLClient:
         for h, state in enumerate(probe_states):
             model: nn.Module = model_cls()
             model.load_state_dict(state)
-            model.to(self.device).eval()
+            model.to(self.device)
+            model.eval()
 
-            total_loss, total_n = 0.0, 0
+            total_loss = 0.0
+            total_n = 0
 
             for x, y in val_loader:
-                x, y = x.to(self.device), y.to(self.device)
+                x = x.to(self.device)
+                y = y.to(self.device)
+
+                logits = model(x)
 
                 total_loss += F.cross_entropy(
-                    model(x),
+                    logits,
                     y,
                     reduction="sum",
                 ).item()
@@ -243,13 +181,11 @@ class FLClient:
                 total_n += y.numel()
 
             profile[h] = total_loss / max(total_n, 1)
+
             model.cpu()
+            del model
 
         return profile
-
-    # ─────────────────────────────────────────────────────
-    #  Local training → 返回 Δw
-    # ─────────────────────────────────────────────────────
 
     def local_train(
         self,
@@ -258,16 +194,13 @@ class FLClient:
         local_epochs: int,
         lr: float,
     ) -> Dict[str, torch.Tensor]:
-        """
-        接收 Server 下发的全局/组模型参数 →
-        本地 SGD →
-        返回模型增量 Δw = W̃ - W。
-        """
-        original_state = copy.deepcopy(global_state)
+        """Run local SGD and return CPU delta weights."""
+        original_state = self._state_to_cpu(global_state)
 
         model: nn.Module = model_cls()
-        model.load_state_dict(copy.deepcopy(global_state))
-        model.to(self.device).train()
+        model.load_state_dict(copy.deepcopy(original_state))
+        model.to(self.device)
+        model.train()
 
         loader = DataLoader(
             self.train_set,
@@ -285,13 +218,21 @@ class FLClient:
 
         for _ in range(local_epochs):
             for x, y in loader:
-                x, y = x.to(self.device), y.to(self.device)
+                x = x.to(self.device)
+                y = y.to(self.device)
 
                 optimizer.zero_grad(set_to_none=True)
-                F.cross_entropy(model(x), y).backward()
+
+                logits = model(x)
+                loss = F.cross_entropy(logits, y)
+
+                loss.backward()
                 optimizer.step()
 
-        updated_state = model.cpu().state_dict()
+        updated_state = self._state_to_cpu(model.state_dict())
+
+        model.cpu()
+        del model
 
         delta: Dict[str, torch.Tensor] = {}
 
@@ -302,20 +243,24 @@ class FLClient:
                     - original_state[key].float()
                 )
             else:
-                # Non-floating buffers are not trained by SGD.
-                # Server will keep them unchanged.
+                # Non-floating buffers are not updated by SGD.
                 delta[key] = torch.zeros_like(updated_state[key])
 
         return delta
 
-    # ─────────────────────────────────────────────────────
-    #  Evaluation
-    # ─────────────────────────────────────────────────────
-
     @torch.no_grad()
-    def evaluate(self, model: nn.Module) -> Tuple[np.ndarray, np.ndarray]:
-        """在本地测试集上推理，返回 (y_true, y_pred)。"""
-        model.to(self.device).eval()
+    def evaluate(
+        self,
+        model: nn.Module,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Evaluate without moving the server's original model.
+
+        A temporary copy is moved to GPU for local inference. This prevents
+        server-side global/group models from being changed from CPU to CUDA.
+        """
+        eval_model = copy.deepcopy(model)
+        eval_model.to(self.device)
+        eval_model.eval()
 
         loader = DataLoader(
             self.test_set,
@@ -325,14 +270,29 @@ class FLClient:
             pin_memory=(self.device.type == "cuda"),
         )
 
-        yt, yp = [], []
+        all_y_true = []
+        all_y_pred = []
 
         for x, y in loader:
-            preds = model(x.to(self.device)).argmax(1).cpu().numpy()
+            x = x.to(self.device)
+            y = y.to(self.device)
 
-            yt.extend(y.numpy().tolist())
-            yp.extend(preds.tolist())
+            logits = eval_model(x)
+            pred = logits.argmax(dim=1)
 
-        model.cpu()
+            all_y_true.append(y.detach().cpu())
+            all_y_pred.append(pred.detach().cpu())
 
-        return np.array(yt), np.array(yp)
+        eval_model.cpu()
+        del eval_model
+
+        if not all_y_true:
+            return (
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+            )
+
+        y_true = torch.cat(all_y_true).numpy()
+        y_pred = torch.cat(all_y_pred).numpy()
+
+        return y_true, y_pred

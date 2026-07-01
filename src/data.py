@@ -1,17 +1,20 @@
-"""Data partitioning, client metadata, and shared utilities."""
+"""Data partitioning, client metadata, and shared utilities.
+
+This version keeps the original CARES-Lite public interfaces but fixes the
+most important experimental issue for NIDS: client samples are assigned
+without replacement, so one raw example is not duplicated across clients.
+"""
 
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║  Utilities                                               ║
-# ╚══════════════════════════════════════════════════════════╝
+# Utilities
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -38,76 +41,134 @@ class TabularDataset(Dataset):
         return torch.from_numpy(self.features[idx]), int(self.targets[idx])
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════════╗
-# ║  Client metadata                                         ║
-# ╚══════════════════════════════════════════════════════════╝
-
 @dataclass
 class ClientMeta:
     """Lightweight metadata describing one client's data partition."""
+
     client_id: int
-    group_id: int                                     # ground-truth (evaluation only)
-    train_indices: List[int] = field(repr=False)      # 用于本地训练
-    val_indices: List[int] = field(repr=False)        # 用于计算 loss profile
-    test_indices: List[int] = field(repr=False)       # 用于评估
+    group_id: int  # ground truth for evaluation only
+    train_indices: List[int] = field(repr=False)
+    val_indices: List[int] = field(repr=False)
+    test_indices: List[int] = field(repr=False)
 
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║  Ground-truth group definition                           ║
-# ╚══════════════════════════════════════════════════════════╝
-
+# Original Fashion-MNIST label groups. Use only when labels are exactly compatible.
 TRUE_GROUPS: List[List[int]] = [
-    [0, 2, 6],   # T-shirt, Pullover, Shirt
-    [1, 3],       # Trouser, Dress
-    [4, 8],       # Coat, Bag
-    [5, 7, 9],   # Sandal, Sneaker, Ankle boot
+    [0, 2, 6],
+    [1, 3],
+    [4, 8],
+    [5, 7, 9],
 ]
 
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║  Helpers                                                 ║
-# ╚══════════════════════════════════════════════════════════╝
+def _as_numpy_targets(dataset: Dataset) -> np.ndarray:
+    targets = getattr(dataset, "targets")
+    if isinstance(targets, torch.Tensor):
+        return targets.cpu().numpy()
+    return np.asarray(targets)
+
 
 def label_to_indices(dataset: Dataset) -> Dict[int, np.ndarray]:
-    targets = dataset.targets
-    if isinstance(targets, torch.Tensor):
-        targets = targets.cpu().numpy()
-    else:
-        targets = np.array(targets)
+    targets = _as_numpy_targets(dataset)
     labels = np.unique(targets)
-    return {int(y): np.where(targets == y)[0] for y in labels}
+    return {int(y): np.where(targets == y)[0].astype(int) for y in labels}
 
 
-def _sample_mixture(
-    pools: Dict[int, np.ndarray],
-    major_labels: List[int],
-    n: int,
-    major_ratio: float,
-    rng: np.random.Generator,
-) -> List[int]:
-    major_labels = [y for y in major_labels if y in pools]
-    bg = [y for y in sorted(pools.keys()) if y not in major_labels]
-    n_major = int(round(n * major_ratio))
+class _NoReplacementLabelAllocator:
+    """Label-aware index allocator that never returns the same index twice."""
 
-    sampled: List[int] = []
-    for _ in range(n_major):
-        if len(major_labels) == 0:
-            raise ValueError("No major labels available for _sample_mixture")
-        y = int(rng.choice(major_labels))
-        sampled.append(int(rng.choice(pools[y])))
-    for _ in range(n - n_major):
-        if len(bg) == 0:
-            raise ValueError("No background labels available for _sample_mixture")
-        y = int(rng.choice(bg))
-        sampled.append(int(rng.choice(pools[y])))
+    def __init__(self, pools: Dict[int, np.ndarray], rng: np.random.Generator):
+        self.rng = rng
+        self.pools: Dict[int, List[int]] = {}
+        for y, indices in pools.items():
+            shuffled = rng.permutation(np.asarray(indices, dtype=int)).tolist()
+            self.pools[int(y)] = shuffled
 
-    rng.shuffle(sampled)
-    return sampled
+    def remaining_labels(self) -> List[int]:
+        return [y for y, idxs in self.pools.items() if len(idxs) > 0]
+
+    def remaining_count(self) -> int:
+        return sum(len(idxs) for idxs in self.pools.values())
+
+    def take_by_probs(self, probs: Dict[int, float], n: int) -> List[int]:
+        """Take up to n samples without replacement according to label probabilities.
+
+        If requested labels are exhausted, the allocator falls back to all labels
+        that still have remaining examples. This avoids silently sampling with
+        replacement while making small/imbalanced datasets usable.
+        """
+        out: List[int] = []
+        for _ in range(n):
+            available = [y for y in self.remaining_labels() if probs.get(y, 0.0) > 0]
+            if not available:
+                available = self.remaining_labels()
+            if not available:
+                break
+            weights = np.array([max(float(probs.get(y, 0.0)), 0.0) for y in available])
+            if weights.sum() <= 0:
+                weights = np.ones(len(available), dtype=np.float64)
+            weights = weights / weights.sum()
+            y = int(self.rng.choice(np.array(available, dtype=int), p=weights))
+            out.append(int(self.pools[y].pop()))
+        self.rng.shuffle(out)
+        return out
 
 
-# ╔══════════════════════════════════════════════════════════╗
-# ║  Build client partitions (with train / val / test split) ║
-# ╚══════════════════════════════════════════════════════════╝
+def _split_train_val(
+    indices: List[int], val_ratio: float, rng: np.random.Generator
+) -> Tuple[List[int], List[int]]:
+    indices = list(indices)
+    rng.shuffle(indices)
+    if len(indices) <= 1 or val_ratio <= 0:
+        return indices, []
+    n_val = int(round(len(indices) * val_ratio))
+    n_val = min(max(1, n_val), len(indices) - 1)
+    val_indices = indices[:n_val]
+    train_indices = indices[n_val:]
+    return train_indices, val_indices
+
+
+def _make_manual_groups(labels: Iterable[int], num_groups: int | None = None) -> List[List[int]]:
+    labels = sorted(int(y) for y in labels)
+    label_set = set(labels)
+
+    # Preserve the original Fashion-MNIST controlled split when exactly applicable.
+    if all(set(g).issubset(label_set) for g in TRUE_GROUPS) and len(label_set) >= 10:
+        if num_groups in (None, 0, len(TRUE_GROUPS)):
+            return [list(g) for g in TRUE_GROUPS]
+
+    if num_groups is None or num_groups <= 0:
+        num_groups = min(len(TRUE_GROUPS), len(labels))
+
+    # Manual label groups cannot exceed the number of labels unless we introduce
+    # artificial distributional groups. Use Dirichlet partition for that purpose.
+    num_groups = max(1, min(int(num_groups), len(labels)))
+    return [labels[i::num_groups] for i in range(num_groups)]
+
+
+def _manual_label_probs(
+    all_labels: List[int], major_labels: List[int], major_ratio: float
+) -> Dict[int, float]:
+    major_labels = [int(y) for y in major_labels if y in all_labels]
+    bg_labels = [int(y) for y in all_labels if y not in major_labels]
+    probs = {int(y): 0.0 for y in all_labels}
+
+    if not major_labels:
+        for y in all_labels:
+            probs[int(y)] = 1.0 / len(all_labels)
+        return probs
+
+    if not bg_labels:
+        for y in major_labels:
+            probs[int(y)] = 1.0 / len(major_labels)
+        return probs
+
+    for y in major_labels:
+        probs[int(y)] = float(major_ratio) / len(major_labels)
+    for y in bg_labels:
+        probs[int(y)] = float(1.0 - major_ratio) / len(bg_labels)
+    return probs
+
 
 def build_client_metas(
     train_dataset: Dataset,
@@ -118,70 +179,48 @@ def build_client_metas(
     major_ratio: float,
     val_ratio: float,
     seed: int,
+    num_clusters: int | None = None,
 ) -> Tuple[List[ClientMeta], List[List[int]]]:
-    """
-    为每个 client 分配 Non-IID 数据，
-    并将 train 数据按 val_ratio 拆分为 train + val。
-    """
+    """Build manual label-skew client partitions without replacement."""
     rng = np.random.default_rng(seed)
     train_pools = label_to_indices(train_dataset)
     test_pools = label_to_indices(test_dataset)
-
     labels = sorted(train_pools.keys())
-    if all(y in train_pools for group in TRUE_GROUPS for y in group):
-        true_groups = TRUE_GROUPS
-    else:
-        num_groups = min(len(TRUE_GROUPS), len(labels))
-        if num_groups == 0:
-            raise ValueError("No labels found in training dataset for manual partitioning")
-        true_groups = [labels[i::num_groups] for i in range(num_groups)]
+
+    if len(labels) == 0:
+        raise ValueError("No labels found in training dataset for manual partitioning")
+
+    true_groups = _make_manual_groups(labels, num_groups=num_clusters)
+    train_alloc = _NoReplacementLabelAllocator(train_pools, rng)
+    test_alloc = _NoReplacementLabelAllocator(test_pools, rng)
 
     metas: List[ClientMeta] = []
     for cid in range(num_clients):
         gid = cid % len(true_groups)
+        probs = _manual_label_probs(labels, true_groups[gid], major_ratio)
 
-        # 先采样完整的训练索引
-        major_labels = [y for y in true_groups[gid] if y in train_pools]
-        all_train = _sample_mixture(
-            train_pools, major_labels, train_samples, major_ratio, rng,
+        client_train_all = train_alloc.take_by_probs(probs, train_samples)
+        train_indices, val_indices = _split_train_val(client_train_all, val_ratio, rng)
+        test_indices = test_alloc.take_by_probs(probs, test_samples)
+
+        if len(train_indices) == 0:
+            raise RuntimeError(
+                f"Client {cid} received no training samples. "
+                "Reduce --num-clients or --train-samples-per-client."
+            )
+
+        metas.append(
+            ClientMeta(
+                client_id=cid,
+                group_id=gid,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                test_indices=test_indices,
+            )
         )
 
-        # 拆分 train / val
-        n_val = max(1, int(round(len(all_train) * val_ratio)))
-        val_indices = all_train[:n_val]
-        train_indices = all_train[n_val:]
-
-        test_indices = _sample_mixture(
-            test_pools, major_labels, test_samples, major_ratio, rng,
-        )
-
-        metas.append(ClientMeta(
-            client_id=cid,
-            group_id=gid,
-            train_indices=train_indices,
-            val_indices=val_indices,
-            test_indices=test_indices,
-        ))
-
+    assert_client_partitions(metas, require_disjoint_test=True)
     return metas, true_groups
-def _sample_by_label_probs(
-    pools: Dict[int, np.ndarray],
-    probs: np.ndarray,
-    n: int,
-    rng: np.random.Generator,
-) -> List[int]:
-    probs = np.asarray(probs, dtype=np.float64)
-    probs = probs / probs.sum()
-
-    sampled: List[int] = []
-    labels = np.array(sorted(pools.keys()), dtype=int)
-    selected = rng.choice(labels, size=n, p=probs)
-
-    for y in selected:
-        sampled.append(int(rng.choice(pools[int(y)])))
-
-    rng.shuffle(sampled)
-    return sampled
 
 
 def build_dirichlet_client_metas(
@@ -196,65 +235,87 @@ def build_dirichlet_client_metas(
     alpha_inter: float = 0.1,
     alpha_intra: float = 10.0,
 ) -> Tuple[List[ClientMeta], List[List[int]]]:
+    """Two-level Dirichlet client partitions without replacement.
+
+    Level 1: each latent group k has a label distribution pi_k.
+    Level 2: each client in group k has a local distribution theta_i around pi_k.
+    group_id is used only for ARI/NMI/Purity evaluation.
     """
-    DPMM-CFL-style two-level Dirichlet partition.
+    if num_clusters <= 0:
+        raise ValueError("num_clusters must be positive for Dirichlet partition")
 
-    Level 1:
-        Each ground-truth cluster k has a label distribution pi_k
-        drawn from Dirichlet(alpha_inter).
-
-    Level 2:
-        Each client inside cluster k has a local label distribution
-        theta_i drawn around pi_k using Dirichlet(alpha_intra * pi_k).
-
-    group_id is the ground-truth cluster id, used only for ARI/NMI/Purity.
-    """
     rng = np.random.default_rng(seed)
     train_pools = label_to_indices(train_dataset)
     test_pools = label_to_indices(test_dataset)
-
     labels = np.array(sorted(train_pools.keys()), dtype=int)
-    num_labels = len(labels)
+    if len(labels) == 0:
+        raise ValueError("No labels found in training dataset for Dirichlet partitioning")
 
-    # K ground-truth cluster-level label distributions
+    num_labels = len(labels)
     cluster_priors = rng.dirichlet(
         alpha=np.full(num_labels, alpha_inter, dtype=np.float64),
         size=num_clusters,
     )
 
-    metas: List[ClientMeta] = []
+    train_alloc = _NoReplacementLabelAllocator(train_pools, rng)
+    test_alloc = _NoReplacementLabelAllocator(test_pools, rng)
 
+    metas: List[ClientMeta] = []
     for cid in range(num_clients):
         gid = cid % num_clusters
         pi_k = cluster_priors[gid]
-
-        # Client distribution around its cluster distribution
         theta_i = rng.dirichlet(alpha_intra * pi_k + 1e-6)
+        probs = {int(y): float(p) for y, p in zip(labels.tolist(), theta_i.tolist())}
 
-        all_train = _sample_by_label_probs(
-            train_pools, theta_i, train_samples, rng
+        client_train_all = train_alloc.take_by_probs(probs, train_samples)
+        train_indices, val_indices = _split_train_val(client_train_all, val_ratio, rng)
+        test_indices = test_alloc.take_by_probs(probs, test_samples)
+
+        if len(train_indices) == 0:
+            raise RuntimeError(
+                f"Client {cid} received no training samples. "
+                "Reduce --num-clients or --train-samples-per-client."
+            )
+
+        metas.append(
+            ClientMeta(
+                client_id=cid,
+                group_id=gid,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                test_indices=test_indices,
+            )
         )
 
-        n_val = max(1, int(round(len(all_train) * val_ratio)))
-        val_indices = all_train[:n_val]
-        train_indices = all_train[n_val:]
-
-        test_indices = _sample_by_label_probs(
-            test_pools, theta_i, test_samples, rng
-        )
-
-        metas.append(ClientMeta(
-            client_id=cid,
-            group_id=gid,
-            train_indices=train_indices,
-            val_indices=val_indices,
-            test_indices=test_indices,
-        ))
-
-    # 只是为了打印展示：每个真实簇 top-3 dominant labels
     true_groups = [
-        [int(labels[x]) for x in np.argsort(-cluster_priors[k])[:3]]
+        [int(labels[x]) for x in np.argsort(-cluster_priors[k])[: min(3, num_labels)]]
         for k in range(num_clusters)
     ]
 
+    assert_client_partitions(metas, require_disjoint_test=True)
     return metas, true_groups
+
+
+def assert_client_partitions(
+    metas: List[ClientMeta], require_disjoint_test: bool = True
+) -> None:
+    """Fail fast when a split contains duplicated raw examples."""
+    all_train_val: List[int] = []
+    all_test: List[int] = []
+
+    for meta in metas:
+        train_set = set(meta.train_indices)
+        val_set = set(meta.val_indices)
+        if train_set.intersection(val_set):
+            raise AssertionError(f"Client {meta.client_id} has train/val overlap")
+        all_train_val.extend(meta.train_indices)
+        all_train_val.extend(meta.val_indices)
+        all_test.extend(meta.test_indices)
+
+    if len(all_train_val) != len(set(all_train_val)):
+        dup = len(all_train_val) - len(set(all_train_val))
+        raise AssertionError(f"Train/val indices overlap across clients: {dup} duplicates")
+
+    if require_disjoint_test and len(all_test) != len(set(all_test)):
+        dup = len(all_test) - len(set(all_test))
+        raise AssertionError(f"Test indices overlap across clients: {dup} duplicates")

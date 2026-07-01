@@ -1,10 +1,13 @@
 #!/usr/bin/env python
-"""
-CARES-Lite: Adaptive Clustered Federated Learning (Plaintext)
-==============================================================
-Entry point: build data → create clients → create server → run pipeline.
+"""CARES-Lite entry point.
+
+This version keeps the original CARES-Lite algorithm path but separates NIDS
+loading/preprocessing from image loading. For NIDS experiments, use
+src.datasets.nids.load_nids_datasets so that leakage columns are dropped and
+preprocessors are fit on train only.
 """
 
+import json
 import os
 from functools import partial
 from pathlib import Path
@@ -13,31 +16,23 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from torchvision import datasets, transforms
 
-from src.config import parse_args
 from src.client import FLClient
-from src.server import FLServer
-from src.model import SmallCNN, TabularMLP
-
+from src.config import parse_args
 from src.data import (
-    set_seed,
-    get_device,
+    assert_client_partitions,
     build_client_metas,
     build_dirichlet_client_metas,
-    TabularDataset,
+    get_device,
+    set_seed,
 )
+from src.datasets.nids import load_nids_datasets
+from src.model import SmallCNN, TabularMLP
+from src.server import FLServer
 
 
 def _get_data_root(args) -> str:
-    """
-    Be compatible with both argument names:
-      --data-dir
-      --data-root
-    """
     if hasattr(args, "data_dir"):
         return args.data_dir
     if hasattr(args, "data_root"):
@@ -45,204 +40,95 @@ def _get_data_root(args) -> str:
     return "./data"
 
 
-def load_datasets(args):
-    """
-    Load FashionMNIST or CIFAR-10 and return dataset metadata needed by SmallCNN.
-
-    Note:
-    For CIFAR-10, this intentionally uses deterministic transforms only.
-    In the current CARES-Lite code, client validation sets are split from the
-    training dataset object. RandomCrop / RandomHorizontalFlip would therefore
-    also affect loss profiling and make DPMM clustering noisier.
-    """
-    dataset_name = getattr(args, "dataset", "fashionmnist").lower()
-    data_root = _get_data_root(args)
-
+def load_image_datasets(args, dataset_name: str, data_root: str):
+    """Load Fashion-MNIST or CIFAR-10 with deterministic transforms."""
     if dataset_name in ["fashionmnist", "fmnist"]:
         mean = (0.2860,)
         std = (0.3530,)
-
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])
-
         train_dataset = datasets.FashionMNIST(
             root=data_root,
             train=True,
             download=True,
             transform=transform,
         )
-
         test_dataset = datasets.FashionMNIST(
             root=data_root,
             train=False,
             download=True,
             transform=transform,
         )
+        return train_dataset, test_dataset, 1, 28, 10, {}
 
-        input_channels = 1
-        image_size = 28
-        num_classes = 10
-
-    elif dataset_name == "cifar10":
+    if dataset_name == "cifar10":
         mean = (0.4914, 0.4822, 0.4465)
         std = (0.2470, 0.2435, 0.2616)
-
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean, std),
         ])
-
         train_dataset = datasets.CIFAR10(
             root=data_root,
             train=True,
             download=True,
             transform=transform,
         )
-
         test_dataset = datasets.CIFAR10(
             root=data_root,
             train=False,
             download=True,
             transform=transform,
         )
+        return train_dataset, test_dataset, 3, 32, 10, {}
 
-        input_channels = 3
-        image_size = 32
-        num_classes = 10
+    raise ValueError(f"Unsupported image dataset: {dataset_name}")
 
-    elif dataset_name in ["cicids2017", "unsw_nb15"]:
-        train_dataset, test_dataset, input_dim, num_classes = load_tabular_dataset(
+
+def load_datasets(args):
+    dataset_name = getattr(args, "dataset", "fashionmnist").lower()
+    data_root = _get_data_root(args)
+
+    if dataset_name in ["fashionmnist", "fmnist", "cifar10"]:
+        return load_image_datasets(args, dataset_name, data_root)
+
+    if dataset_name in ["cicids2017", "unsw_nb15"]:
+        train_dataset, test_dataset, input_dim, num_classes, metadata = load_nids_datasets(
             args,
             dataset_name,
             data_root,
         )
-        input_channels = input_dim
-        image_size = 1
-    else:
-        raise ValueError(
-            f"Unsupported dataset: {dataset_name}. "
-            "Choose from: fashionmnist, fmnist, cifar10, cicids2017, unsw_nb15."
-        )
+        return train_dataset, test_dataset, input_dim, 1, num_classes, metadata
 
-    return train_dataset, test_dataset, input_channels, image_size, num_classes
+    raise ValueError(
+        f"Unsupported dataset: {dataset_name}. Choose from: "
+        "fashionmnist, fmnist, cifar10, cicids2017, unsw_nb15."
+    )
 
 
-def _infer_tabular_label_column(dataset_name: str, args) -> str:
-    if args.tabular_label_column:
-        return args.tabular_label_column
-
-    if dataset_name == "cicids2017":
-        return "Label"
-    if dataset_name == "unsw_nb15":
-        return "attack_cat"
-
-    return "Label"
-
-
-def _read_dataframe(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    if "Unnamed: 0" in df.columns:
-        df = df.drop(columns=["Unnamed: 0"])
-    return df
-
-
-def _make_tabular_dataset(
-    df: pd.DataFrame,
-    label_column: str,
-) -> tuple[TabularDataset, np.ndarray, np.ndarray]:
-    if label_column not in df.columns:
-        raise ValueError(
-            f"Label column '{label_column}' not found in tabular dataset. "
-            f"Available columns: {list(df.columns)}"
-        )
-
-    labels = df[label_column].astype(str).fillna("UNKNOWN").to_numpy(dtype=object)
-    features = df.drop(columns=[label_column])
-    numeric_features = features.select_dtypes(include=[np.number])
-
-    if numeric_features.shape[1] == 0:
-        raise ValueError("No numeric features found in tabular dataset.")
-
-    X = numeric_features.fillna(0.0).to_numpy(dtype=np.float32)
-    return X, labels
-
-
-def load_tabular_dataset(
-    args,
-    dataset_name: str,
-    data_root: str,
-):
-    label_column = _infer_tabular_label_column(dataset_name, args)
-
-    if args.tabular_train_file and args.tabular_test_file:
-        train_df = _read_dataframe(args.tabular_train_file)
-        test_df = _read_dataframe(args.tabular_test_file)
-    elif args.tabular_all_file:
-        all_df = _read_dataframe(args.tabular_all_file)
-        train_df, test_df = train_test_split(
-            all_df,
-            test_size=args.tabular_test_split,
-            stratify=all_df[label_column] if label_column in all_df.columns else None,
-            random_state=args.seed,
-        )
-    else:
-        default_path = Path(data_root) / (
-            "CICIDS2017.csv" if dataset_name == "cicids2017" else "UNSW_NB15.csv"
-        )
-        if not default_path.exists():
-            raise FileNotFoundError(
-                f"Expected default tabular dataset at {default_path}. "
-                "Please provide --tabular-train-file and --tabular-test-file or --tabular-all-file."
-            )
-        all_df = _read_dataframe(str(default_path))
-        train_df, test_df = train_test_split(
-            all_df,
-            test_size=args.tabular_test_split,
-            stratify=all_df[label_column] if label_column in all_df.columns else None,
-            random_state=args.seed,
-        )
-
-    X_train, y_train = _make_tabular_dataset(train_df, label_column)
-    X_test, y_test = _make_tabular_dataset(test_df, label_column)
-
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-
-    label_values = np.unique(np.concatenate([y_train, y_test]))
-    label_map = {val: idx for idx, val in enumerate(sorted(label_values))}
-
-    y_train = np.array([label_map[val] for val in y_train], dtype=np.int64)
-    y_test = np.array([label_map[val] for val in y_test], dtype=np.int64)
-
-    train_dataset = TabularDataset(X_train, y_train)
-    test_dataset = TabularDataset(X_test, y_test)
-
-    return train_dataset, test_dataset, X_train.shape[1], int(y_train.max() + 1)
+def _jsonable_true_groups(true_groups):
+    return [[int(x) for x in group] for group in true_groups]
 
 
 def main():
     args = parse_args()
     set_seed(args.seed)
     device = get_device()
-
     print(f"Device: {device}")
 
-    # ── 1. 加载数据集 ────────────────────────────────────
-    train_dataset, test_dataset, input_channels, image_size, num_classes = load_datasets(args)
-
+    train_dataset, test_dataset, input_channels, image_size, num_classes, dataset_meta = load_datasets(args)
     dataset_name = getattr(args, "dataset", "fashionmnist").lower()
 
     print(f"\nDataset: {dataset_name}")
-    print(f"  input_channels: {input_channels}")
-    print(f"  image_size:      {image_size}")
-    print(f"  num_classes:     {num_classes}")
-    print(f"  train size:      {len(train_dataset)}")
-    print(f"  test size:       {len(test_dataset)}")
+    print(f" input_channels/input_dim: {input_channels}")
+    print(f" image_size: {image_size}")
+    print(f" num_classes: {num_classes}")
+    print(f" train size: {len(train_dataset)}")
+    print(f" test size: {len(test_dataset)}")
 
-    # ── 2. 构建 client metadata ──────────────────────────
+    # Build client metadata.
     if args.partition == "dirichlet":
         metas, true_groups = build_dirichlet_client_metas(
             train_dataset,
@@ -266,18 +152,23 @@ def main():
             major_ratio=args.major_ratio,
             val_ratio=args.val_ratio,
             seed=args.seed,
+            num_clusters=args.num_true_clusters,
         )
 
-    print("\nTrue groups (ground-truth, for evaluation only):")
+    assert_client_partitions(metas, require_disjoint_test=True)
+    actual_true_clusters = len(set(int(m.group_id) for m in metas))
+
+    print("\nTrue groups (ground-truth for evaluation only):")
     for gid, labels in enumerate(true_groups):
-        print(f"  G{gid}: {labels}")
+        print(f" G{gid}: {labels}")
+    print(f" requested num_true_clusters: {args.num_true_clusters}")
+    print(f" actual_true_clusters: {actual_true_clusters}")
 
     print("\nClient data split example (client 0):")
-    print(f"  train: {len(metas[0].train_indices)} samples")
-    print(f"  val:   {len(metas[0].val_indices)} samples")
-    print(f"  test:  {len(metas[0].test_indices)} samples")
+    print(f" train: {len(metas[0].train_indices)} samples")
+    print(f" val: {len(metas[0].val_indices)} samples")
+    print(f" test: {len(metas[0].test_indices)} samples")
 
-    # ── 3. 实例化 FLClient ───────────────────────────────
     fl_clients = [
         FLClient(
             meta=m,
@@ -290,10 +181,8 @@ def main():
         )
         for m in metas
     ]
-
     print(f"\nCreated {len(fl_clients)} FL clients")
 
-    # ── 4. 构造模型工厂，并实例化 FLServer ───────────────
     if dataset_name in ["fashionmnist", "fmnist", "cifar10"]:
         model_fn = partial(
             SmallCNN,
@@ -329,20 +218,16 @@ def main():
         client_frac=args.client_frac,
         local_epochs=args.local_epochs,
         lr=args.lr,
-
-        # New profiling-anchor arguments.
         probe_anchor=args.probe_anchor,
         anchor_ema_beta=args.anchor_ema_beta,
         profile_during_training=args.profile_during_training,
     )
 
-    # ── 5. 保存结果 ──────────────────────────────────────
     print("\n" + "=" * 55)
     print(" Final Results")
     print("=" * 55)
-
     for k, v in metrics.items():
-        print(f"  {k}: {v}")
+        print(f" {k}: {v}")
 
     output_path = Path(args.output_dir) / args.output_name
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -350,9 +235,13 @@ def main():
     row = {
         "method": "CARES-Lite",
         "dataset": dataset_name,
+        "tabular_task": getattr(args, "tabular_task", ""),
         "partition": args.partition,
         "num_clients": args.num_clients,
-        "num_true_clusters": args.num_true_clusters,
+        "num_true_clusters": args.num_true_clusters,  # kept for backward compatibility
+        "num_true_clusters_arg": args.num_true_clusters,
+        "actual_true_clusters": actual_true_clusters,
+        "true_groups": json.dumps(_jsonable_true_groups(true_groups), ensure_ascii=False),
         "total_rounds": args.total_rounds,
         "warmup_rounds": args.warmup_rounds,
         "cluster_interval": args.cluster_interval,
@@ -367,13 +256,16 @@ def main():
         "client_frac": args.client_frac,
         "local_epochs": args.local_epochs,
         "lr": args.lr,
+        "train_samples_per_client": args.train_samples_per_client,
+        "test_samples_per_client": args.test_samples_per_client,
+        "val_ratio": args.val_ratio,
+        **dataset_meta,
         **metrics,
     }
 
     df = pd.DataFrame([row])
     df.to_csv(output_path, index=False)
-
-    print(f"\nSaved → {output_path}")
+    print(f"\nSaved -> {output_path}")
 
 
 if __name__ == "__main__":
