@@ -1,0 +1,275 @@
+Device: cuda
+
+[NIDS] Dataset preprocessing summary
+  dataset: unsw_nb15
+  task: binary
+  label_column: label
+  split_source: explicit_train_test
+  dropped_columns_train: ['attack_cat', 'id', 'label']
+  train shape: (175341, 194)
+  test shape: (82332, 194)
+  label_map: {'0': 0, '1': 1}
+
+Dataset: unsw_nb15
+ input_channels/input_dim: 194
+ image_size: 1
+ num_classes: 2
+ train size: 175341
+ test size: 82332
+
+True groups (ground-truth for evaluation only):
+ G0: [1, 0]
+ G1: [1, 0]
+ requested num_true_clusters: 2
+ actual_true_clusters: 2
+
+Client data split example (client 0):
+ train: 1600 samples
+ val: 400 samples
+ test: 500 samples
+
+Created 20 FL clients
+
+=======================================================
+ Phase 0: Initialization
+=======================================================
+  Global model initialized
+  Total rounds: 50
+  Warm-up rounds: 5
+  Cluster interval tau: 5
+  Probe pool M: 16, sigma: 0.05
+  Probes: 1 original + 2 class-ablation + 13 random
+  Probe anchor: ema_global
+  Anchor EMA beta: 0.9
+  Profile during training rounds: False
+
+=======================================================
+ Phase 1: Warm-up Global FedAvg
+=======================================================
+  [Warmup] Round 1/5 done (selected 10 clients)
+  [Eval:Warmup R1] ACC=0.8714 | Precision=0.4357 | Recall=0.5000 | F1=0.4656 | GlobalMacroF1=0.4656
+  [Warmup] Round 2/5 done (selected 10 clients)
+  [Eval:Warmup R2] ACC=0.8786 | Precision=0.9389 | Recall=0.5280 | F1=0.5205 | GlobalMacroF1=0.5205
+  [Warmup] Round 3/5 done (selected 10 clients)
+  [Eval:Warmup R3] ACC=0.9030 | Precision=0.9499 | Recall=0.6229 | F1=0.6709 | GlobalMacroF1=0.6709
+  [Warmup] Round 4/5 done (selected 10 clients)
+  [Eval:Warmup R4] ACC=0.9296 | Precision=0.9626 | Recall=0.7263 | F1=0.7921 | GlobalMacroF1=0.7921
+  [Warmup] Round 5/5 done (selected 10 clients)
+  [Eval:Warmup R5] ACC=0.9312 | Precision=0.9634 | Recall=0.7325 | F1=0.7984 | GlobalMacroF1=0.7984
+
+=======================================================
+ Transition: First DPMM Clustering
+=======================================================
+  [Server] Full profiling for 20 clients (probe_seed=9142) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.165 13.311 84.83   0.196  0.185] ...
+    std:   [ 0.194 17.659 17.295  0.237  0.218] ...
+    range: [ 0.752 71.171 69.752  0.929  0.853] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.3705
+  [Diagnostics] Avg intra-client std (across probes): 21.2815
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Initialized 2 group models from global model
+  [Server] Anchor model initialized from warm-up global model
+
+=======================================================
+ Phase 2: Clustered FedAvg with Dynamic Re-clustering
+=======================================================
+  [Clustered] Round 6/50 done (selected 10 clients)
+  [Eval:R6] K=2 | ACC=0.9338 | Precision=0.9603 | Recall=0.7446 | F1=0.8095 | GlobalMacroF1=0.8095 | ClientAvgMacroF1=0.6403 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+  [Clustered] Round 10/50 done (selected 10 clients)
+  [Eval:R10] K=2 | ACC=0.9423 | Precision=0.9601 | Recall=0.7803 | F1=0.8413 | GlobalMacroF1=0.8413 | ClientAvgMacroF1=0.6566 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 11 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9152) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.15  13.28  84.797  0.178  0.155] ...
+    std:   [ 0.175 17.617 17.289  0.211  0.171] ...
+    range: [ 0.676 70.996 69.728  0.821  0.663] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.3557
+  [Diagnostics] Avg intra-client std (across probes): 21.2739
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 15/50 done (selected 10 clients)
+  [Eval:R15] K=2 | ACC=0.9438 | Precision=0.9559 | Recall=0.7891 | F1=0.8477 | GlobalMacroF1=0.8477 | ClientAvgMacroF1=0.6591 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 16 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9157) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.138 13.236 84.664  0.166  0.158] ...
+    std:   [ 0.162 17.558 17.262  0.197  0.182] ...
+    range: [ 0.621 70.75  69.623  0.761  0.708] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.3381
+  [Diagnostics] Avg intra-client std (across probes): 21.2418
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 20/50 done (selected 10 clients)
+  [Eval:R20] K=2 | ACC=0.9450 | Precision=0.9391 | Recall=0.8054 | F1=0.8560 | GlobalMacroF1=0.8560 | ClientAvgMacroF1=0.6620 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 21 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9162) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.127 13.191 84.54   0.146  0.168] ...
+    std:   [ 0.151 17.495 17.238  0.168  0.204] ...
+    range: [ 0.574 70.49  69.528  0.642  0.783] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.3142
+  [Diagnostics] Avg intra-client std (across probes): 21.2120
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 25/50 done (selected 10 clients)
+  [Eval:R25] K=2 | ACC=0.9473 | Precision=0.9268 | Recall=0.8259 | F1=0.8671 | GlobalMacroF1=0.8671 | ClientAvgMacroF1=0.6659 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 26 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9167) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.12  13.152 84.42   0.13   0.121] ...
+    std:   [ 0.143 17.441 17.214  0.149  0.132] ...
+    range: [ 0.541 70.268 69.436  0.575  0.502] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.2881
+  [Diagnostics] Avg intra-client std (across probes): 21.1847
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 30/50 done (selected 10 clients)
+  [Eval:R30] K=2 | ACC=0.9461 | Precision=0.9387 | Recall=0.8107 | F1=0.8598 | GlobalMacroF1=0.8598 | ClientAvgMacroF1=0.6634 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 31 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9172) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.115 13.121 84.315  0.125  0.124] ...
+    std:   [ 0.138 17.4   17.192  0.138  0.134] ...
+    range: [ 0.521 70.095 69.355  0.528  0.516] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.2908
+  [Diagnostics] Avg intra-client std (across probes): 21.1560
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 35/50 done (selected 10 clients)
+  [Eval:R35] K=2 | ACC=0.9460 | Precision=0.9446 | Recall=0.8060 | F1=0.8580 | GlobalMacroF1=0.8580 | ClientAvgMacroF1=0.6632 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 36 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9177) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.112 13.095 84.233  0.122  0.125] ...
+    std:   [ 0.133 17.364 17.176  0.146  0.131] ...
+    range: [ 0.502 69.946 69.291  0.557  0.502] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.2888
+  [Diagnostics] Avg intra-client std (across probes): 21.1338
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 40/50 done (selected 10 clients)
+  [Eval:R40] K=2 | ACC=0.9454 | Precision=0.9436 | Recall=0.8040 | F1=0.8562 | GlobalMacroF1=0.8562 | ClientAvgMacroF1=0.6621 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 41 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9182) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.111 13.078 84.137  0.127  0.136] ...
+    std:   [ 0.134 17.339 17.156  0.148  0.164] ...
+    range: [ 0.502 69.843 69.216  0.558  0.631] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.2855
+  [Diagnostics] Avg intra-client std (across probes): 21.1099
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 45/50 done (selected 10 clients)
+  [Eval:R45] K=2 | ACC=0.9445 | Precision=0.9438 | Recall=0.7998 | F1=0.8530 | GlobalMacroF1=0.8530 | ClientAvgMacroF1=0.6625 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+  [Server] Re-clustering at round 46 ...
+  [Server] Profiling base: ema_global anchor model
+  [Server] Full profiling for 20 clients (probe_seed=9187) ...
+    profiled 20/20
+
+  [Diagnostics] Profile matrix shape: (20, 16)
+  [Diagnostics] Per-dimension stats (across clients):
+    mean:  [ 0.111 13.062 84.058  0.129  0.138] ...
+    std:   [ 0.134 17.318 17.14   0.15   0.171] ...
+    range: [ 0.501 69.755 69.154  0.572  0.652] ...
+  [Diagnostics] Avg inter-client std (across dims): 2.2856
+  [Diagnostics] Avg intra-client std (across probes): 21.0895
+  Profile diversity looks reasonable
+  [Server] K = 2
+    cluster 0: 13 clients [G0:3, G1:10]
+    cluster 1: 7 clients [G0:7]
+  [Server] Matched and inherited 2 group models after re-clustering
+  [Clustered] Round 50/50 done (selected 10 clients)
+  [Eval:R50] K=2 | ACC=0.9459 | Precision=0.9510 | Recall=0.8013 | F1=0.8561 | GlobalMacroF1=0.8561 | ClientAvgMacroF1=0.6640 | ARI=0.4643 | NMI=0.5102 | Purity=0.8500
+
+=======================================================
+ Evaluation
+=======================================================
+
+=======================================================
+ Final Results
+=======================================================
+ k_pred: 2
+ acc: 0.9459
+ precision: 0.9509826971823225
+ recall: 0.8012576783360359
+ f1: 0.8561392087427793
+ tn: 780
+ fp: 506
+ fn: 35
+ tp: 8679
+ client_avg_acc: 0.9459
+ micro_acc: 0.9459
+ client_avg_macro_f1: 0.663976144911166
+ global_macro_f1: 0.8561392087427793
+ client_avg_precision: 0.7053528725190296
+ client_avg_recall: 0.6481591630535923
+ client_avg_f1: 0.663976144911166
+ ari: 0.46434494195688225
+ nmi: 0.5102432713148234
+ purity: 0.85
+
+Saved -> outputs/cares_nids_fixed_metric/cares_unsw_seed42_fixed_metric.csv

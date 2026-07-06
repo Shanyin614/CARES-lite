@@ -479,6 +479,31 @@ class FLServer:
             return self._state_to_cpu(self.anchor_state)
 
         raise ValueError(f"Unsupported probe_anchor: {probe_anchor}")
+    @staticmethod
+    def _all_class_labels(num_classes: int) -> List[int]:
+        """Complete class set for fixed-label metrics."""
+        return list(range(int(num_classes)))
+
+    @staticmethod
+    def _fixed_macro_f1(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        num_classes: int,
+    ) -> float:
+        """Macro-F1 over all classes, including locally absent classes."""
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+        if y_true.size == 0:
+            return 0.0
+        return float(
+            f1_score(
+                y_true,
+                y_pred,
+                labels=FLServer._all_class_labels(num_classes),
+                average="macro",
+                zero_division=0,
+            )
+        )
 
     @staticmethod
     def _paper_classification_metrics(
@@ -486,19 +511,6 @@ class FLServer:
         y_pred: np.ndarray,
         num_classes: int,
     ) -> Dict[str, float]:
-        """
-        Compute paper-style classification metrics.
-
-        Binary NIDS:
-            normal = 0
-            attack = 1
-
-        ACC is overall accuracy.
-        Precision / Recall / F1 use attack class 1 as positive class.
-
-        For multiclass tasks:
-            Precision / Recall / F1 are macro-averaged.
-        """
         y_true = np.asarray(y_true)
         y_pred = np.asarray(y_pred)
 
@@ -514,77 +526,74 @@ class FLServer:
                 "tp": 0,
             }
 
-        acc = float((y_true == y_pred).mean())
+        acc = float(np.mean(y_true == y_pred))
 
-        if num_classes == 2:
-            pos_label = 1
-
+        if int(num_classes) == 2:
+            # Binary NIDS paper metrics:
+            # report attack/positive-class precision, recall, and F1.
             precision = float(
                 precision_score(
                     y_true,
                     y_pred,
-                    pos_label=pos_label,
+                    pos_label=1,
                     average="binary",
                     zero_division=0,
                 )
             )
-
             recall = float(
                 recall_score(
                     y_true,
                     y_pred,
-                    pos_label=pos_label,
+                    pos_label=1,
                     average="binary",
                     zero_division=0,
                 )
             )
-
             f1 = float(
                 f1_score(
                     y_true,
                     y_pred,
-                    pos_label=pos_label,
+                    pos_label=1,
                     average="binary",
                     zero_division=0,
                 )
             )
-
-            y_true_pos = y_true == pos_label
-            y_pred_pos = y_pred == pos_label
-
-            tp = int(np.logical_and(y_true_pos, y_pred_pos).sum())
-            tn = int(np.logical_and(~y_true_pos, ~y_pred_pos).sum())
-            fp = int(np.logical_and(~y_true_pos, y_pred_pos).sum())
-            fn = int(np.logical_and(y_true_pos, ~y_pred_pos).sum())
+            tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+            fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+            fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+            tp = int(np.sum((y_true == 1) & (y_pred == 1)))
 
         else:
+            # Multiclass metrics:
+            # use fixed-label macro averaging over the full class set.
+            labels = FLServer._all_class_labels(num_classes)
             precision = float(
                 precision_score(
                     y_true,
                     y_pred,
+                    labels=labels,
                     average="macro",
                     zero_division=0,
                 )
             )
-
             recall = float(
                 recall_score(
                     y_true,
                     y_pred,
+                    labels=labels,
                     average="macro",
                     zero_division=0,
                 )
             )
-
             f1 = float(
                 f1_score(
                     y_true,
                     y_pred,
+                    labels=labels,
                     average="macro",
                     zero_division=0,
                 )
             )
-
             tn, fp, fn, tp = 0, 0, 0, 0
 
         return {
@@ -592,11 +601,12 @@ class FLServer:
             "precision": precision,
             "recall": recall,
             "f1": f1,
-            "tn": tn,
-            "fp": fp,
-            "fn": fn,
-            "tp": tp,
+            "tn": int(tn),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
         }
+
 
     def _cluster_quality_metrics(self) -> Dict[str, float]:
         """
@@ -805,15 +815,11 @@ class FLServer:
             client_f1s.append(client_metrics["f1"])
 
             macro_f1s.append(
-                f1_score(
-                    y_true,
-                    y_pred,
-                    average="macro",
-                    zero_division=0,
-                )
+                self._fixed_macro_f1(y_true, y_pred, num_classes)
                 if n_samples > 0
                 else 0.0
             )
+
 
             all_y_true.extend(y_true.tolist())
             all_y_pred.extend(y_pred.tolist())
@@ -831,17 +837,15 @@ class FLServer:
         )
 
         global_macro_f1 = (
-            float(
-                f1_score(
-                    all_y_true_arr,
-                    all_y_pred_arr,
-                    average="macro",
-                    zero_division=0,
-                )
+            self._fixed_macro_f1(
+                all_y_true_arr,
+                all_y_pred_arr,
+                num_classes,
             )
             if total_n > 0
             else 0.0
         )
+
 
         return {
             # Paper metrics: pooled globally across every client test sample.
@@ -921,15 +925,11 @@ class FLServer:
             client_f1s.append(client_metrics["f1"])
 
             macro_f1s.append(
-                f1_score(
-                    y_true,
-                    y_pred,
-                    average="macro",
-                    zero_division=0,
-                )
+                self._fixed_macro_f1(y_true, y_pred, num_classes)
                 if n_samples > 0
                 else 0.0
             )
+
 
             all_y_true.extend(y_true.tolist())
             all_y_pred.extend(y_pred.tolist())
@@ -947,13 +947,10 @@ class FLServer:
         )
 
         global_macro_f1 = (
-            float(
-                f1_score(
-                    all_y_true_arr,
-                    all_y_pred_arr,
-                    average="macro",
-                    zero_division=0,
-                )
+            self._fixed_macro_f1(
+                all_y_true_arr,
+                all_y_pred_arr,
+                num_classes,
             )
             if total_n > 0
             else 0.0
